@@ -280,9 +280,7 @@ class PPChunkPlanner:
                 break
         if num_reqs < 2:
             return 0.0
-        return cost.o + math.sqrt(
-            sum_cum_work / num_reqs * cost.o / (self.pp_size - 1)
-        )
+        return cost.o + math.sqrt(sum_cum_work / num_reqs * cost.o / (self.pp_size - 1))
 
     def plan(self, N: int, L0: int, T: float | None = None) -> list[int]:
         """Chunk sizes a lone request would get, in scheduling order."""
