@@ -286,6 +286,7 @@ class _FakeKVTransferConfig:
     ) -> None:
         self.kv_role = kv_role
         self.kv_connector_extra_config = extra_config or {}
+        self.enable_early_recv = False
 
     def get_from_extra_config(self, key: str, default: object) -> object:
         return self.kv_connector_extra_config.get(key, default)
