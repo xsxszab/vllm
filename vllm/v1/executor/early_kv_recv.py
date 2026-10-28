@@ -51,6 +51,30 @@ class EarlyKVRecvSender:
         self._socket = make_zmq_socket(zmq.Context.instance(), path, zmq.PUSH)
         self._last_activity = time.perf_counter()
         self._next_poll = 0.0
+        # EXPERIMENT ONLY (not for upstream): disable the between-RPC spin, and
+        # count how much the worker spins.
+        self._trace_no_spin = os.environ.get("VLLM_EARLY_RECV_NO_SPIN") == "1"
+        self._trace = os.environ.get("VLLM_EARLY_RECV_TRACE") == "1"
+        self._trace_spin_s = 0.0
+        self._trace_spin_iters = 0
+        self._trace_polls = 0
+        self._trace_next_report = time.perf_counter() + 10.0
+
+    def _trace_report(self, now: float) -> None:
+        if not self._trace or now < self._trace_next_report:
+            return
+        logger.info(
+            "EARLY_RECV_TRACE spin_stats - %.6f pid=%d spin_s=%.3f iters=%d polls=%d",
+            time.time(),
+            os.getpid(),
+            self._trace_spin_s,
+            self._trace_spin_iters,
+            self._trace_polls,
+        )
+        self._trace_spin_s = 0.0
+        self._trace_spin_iters = 0
+        self._trace_polls = 0
+        self._trace_next_report = now + 10.0
 
     def step_rpc_done(self) -> None:
         """Worker thread: an ``execute_model`` or ``sample_tokens`` RPC finished."""
@@ -65,19 +89,26 @@ class EarlyKVRecvSender:
         once an RPC is readable, ``rpc_mq`` is shutting down, or no step RPC
         arrived for ``_ACTIVE_WINDOW_S``, so the worker blocks in ``dequeue()``.
         """
-        if not has_kv_transfer_group():
+        if not has_kv_transfer_group() or self._trace_no_spin:
             return False
         connector = get_kv_transfer_group()
-        while connector.has_pending_recving() and not rpc_mq.shutting_down:
-            if rpc_mq.readable():
-                return False
-            now = time.perf_counter()
-            if now - self._last_activity > _ACTIVE_WINDOW_S:
-                return False
-            if now >= self._next_poll:
-                return True
-            sched_yield()
-        return False
+        start = time.perf_counter()
+        try:
+            while connector.has_pending_recving() and not rpc_mq.shutting_down:
+                if rpc_mq.readable():
+                    return False
+                now = time.perf_counter()
+                if now - self._last_activity > _ACTIVE_WINDOW_S:
+                    return False
+                if now >= self._next_poll:
+                    return True
+                self._trace_spin_iters += 1
+                sched_yield()
+            return False
+        finally:
+            end = time.perf_counter()
+            self._trace_spin_s += end - start
+            self._trace_report(end)
 
     def poll(self) -> None:
         """Send the receives that completed since the last poll.
@@ -86,6 +117,8 @@ class EarlyKVRecvSender:
         a failed step; raising it here instead would leave the other workers
         waiting in their next collective.
         """
+        self._trace_polls += 1
+        self._trace_report(time.perf_counter())
         try:
             with torch.inference_mode():
                 req_ids = get_kv_transfer_group().poll_finished_recving()
