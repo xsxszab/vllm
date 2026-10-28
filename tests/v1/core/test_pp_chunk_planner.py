@@ -3,6 +3,7 @@
 """Unit tests for the equal-time PP prefill chunk planner (CPU only)."""
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from vllm.v1.core.sched.pp_chunk_planner import (
     ChunkCostModel,
     PPChunkPlanner,
+    PPChunkStep,
     fit_chunk_cost,
 )
 
@@ -203,3 +205,119 @@ def test_total_work_is_chunking_independent():
         total += COST.work(c, L)
         L += c
     assert math.isclose(total, COST.total_work(N, L0), rel_tol=1e-9)
+
+
+def _req(num_tokens: int, num_computed_tokens: int = 0, **kwargs) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id="r",
+        num_tokens=num_tokens,
+        num_computed_tokens=num_computed_tokens,
+        pp_chunk_target_ms=None,
+        **kwargs,
+    )
+
+
+def test_queue_target_uses_mean_cumulative_work():
+    """FCFS backlog: T* is taken for the mean of each request's work plus the
+    work queued ahead of it."""
+    planner = make_planner(4)
+    N = 64 * 1024
+    W = COST.total_work(N, 0)
+    queue = [_req(N), _req(N, 1024), _req(N)]
+    cum = [COST.total_work(N, 0)]
+    cum.append(cum[-1] + COST.total_work(N, 1024))
+    cum.append(cum[-1] + W)
+    expected = COST.o + math.sqrt(sum(cum) / 3 * COST.o / 3)
+    assert planner.queue_target_time(queue) == pytest.approx(expected)
+
+
+def test_queue_target_needs_two_prefills():
+    planner = make_planner(4)
+    N = 64 * 1024
+    assert planner.queue_target_time([]) == 0
+    assert planner.queue_target_time([_req(N)]) == 0
+    # One token left (full prefix hit, decode) is not queued prefill work.
+    assert planner.queue_target_time([_req(N), _req(N, N - 1)]) == 0
+    assert make_planner(1).queue_target_time([_req(N), _req(N)]) == 0
+
+
+def test_queue_target_grows_with_backlog_and_bounds_scan():
+    N = 32 * 1024
+    planner = PPChunkPlanner(COST, 4, GRAN, C_MIN, 4096)
+    targets = [planner.queue_target_time([_req(N)] * k) for k in range(2, 10)]
+    assert targets == sorted(targets)
+
+    def endless(counter):
+        while True:
+            counter.append(None)
+            yield _req(N)
+
+    # Stops once the head's chunk alone fills the token budget.
+    consumed: list[None] = []
+    T = planner.queue_target_time(endless(consumed))
+    assert T - COST.o >= COST.work(4096, 0)
+    assert len(consumed) < 64
+    # Otherwise the scan is bounded.
+    consumed = []
+    make_planner(4).queue_target_time(endless(consumed))
+    assert len(consumed) == 64
+
+
+def test_step_passes_decodes_through():
+    """A decode, including a spec-decode padded first decode step after a
+    full prefix hit, is neither capped nor sets the step target."""
+    step = PPChunkStep(make_planner(4))
+    req = _req(33, 32)
+    assert step.cap(req, 32, 4) == 4
+    step.commit(req, 32, 4)
+    assert step.target_ms is None
+    assert req.pp_chunk_target_ms is None
+
+
+def test_step_caps_resumed_output_tokens():
+    """A preempted request recomputes its outputs as prefill too."""
+    planner = make_planner(4)
+    N, prompt = 100_000, 60_000
+    req = _req(N, prompt, num_prompt_tokens=prompt)
+    step = PPChunkStep(planner)
+    cap = step.cap(req, prompt, C_MAX)
+    assert cap == planner.plan(N, prompt)[0] < C_MAX
+    step.commit(req, prompt, cap)
+    assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, prompt))
+
+
+@pytest.mark.parametrize("fits", [True, False])
+def test_step_packs_next_request_within_target(fits: bool):
+    """After A's last chunk, B gets the rest of A's target if that holds at
+    least a c_min chunk, else waits for the next step."""
+    planner = make_planner(4)
+    N_a, tail = 100_000, 600
+    L_a = N_a - tail
+    spare = COST.work(2 * C_MIN, 0) if fits else COST.work(C_MIN, 0) / 2
+    a = _req(N_a, L_a)
+    a.pp_chunk_target_ms = COST.o + COST.work(tail, L_a) + spare
+    b = _req(16 * 1024)
+
+    step = PPChunkStep(planner)
+    assert step.cap(a, L_a, tail) == tail
+    step.commit(a, L_a, tail)
+    cap_b = step.cap(b, 0, 16 * 1024)
+    if fits:
+        assert cap_b == planner.max_chunk(spare, 0, 16 * 1024) >= C_MIN
+    else:
+        assert cap_b == 0
+
+
+def test_step_first_chunk_uses_queue_target():
+    planner = make_planner(4)
+    N = 128 * 1024
+    T = planner.target_time(N, 0)
+    for queue_ms, expected_ms in ((0.0, T), (T / 2, T), (2 * T, 2 * T)):
+        step = PPChunkStep(planner, queue_target_ms=queue_ms)
+        req = _req(N)
+        cap = step.cap(req, 0, C_MAX)
+        assert cap == planner.max_chunk(expected_ms - COST.o, 0, N)
+        step.commit(req, 0, cap)
+        assert step.target_ms == pytest.approx(expected_ms)
+        # The request keeps its own single-request target.
+        assert req.pp_chunk_target_ms == pytest.approx(T)

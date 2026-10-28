@@ -49,7 +49,12 @@ from vllm.v1.core.sched.output import (
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.pp_chunk_planner import PPChunkPlanner, PPChunkStep
+from vllm.v1.core.sched.pp_chunk_planner import (
+    PP_CHUNK_ALIGNMENT,
+    ChunkCostModel,
+    PPChunkPlanner,
+    PPChunkStep,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -145,8 +150,19 @@ class Scheduler(SchedulerInterface):
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
         )
-        # Set by EngineCore once the chunk cost model is known.
         self.pp_chunk_planner: PPChunkPlanner | None = None
+        if self.scheduler_config.pp_dynamic_chunking:
+            assert self.scheduler_config.pp_dynamic_chunk_cost is not None
+            self.pp_chunk_planner = PPChunkPlanner(
+                ChunkCostModel.from_json(self.scheduler_config.pp_dynamic_chunk_cost),
+                pp_size=self.parallel_config.pipeline_parallel_size,
+                gran=PP_CHUNK_ALIGNMENT,
+                c_min=min(
+                    self.scheduler_config.pp_dynamic_chunk_min_tokens,
+                    self.max_num_scheduled_tokens,
+                ),
+                c_max=self.max_num_scheduled_tokens,
+            )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -688,10 +704,6 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
-    def set_pp_chunk_planner(self, planner: PPChunkPlanner | None) -> None:
-        """Enable (or disable with None) equal-time prefill chunking."""
-        self.pp_chunk_planner = planner
-
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -736,11 +748,14 @@ class Scheduler(SchedulerInterface):
         # Whether any scheduled request has a synchronous connector KV load.
         has_sync_kv_loads = False
         # Equal-time prefill chunking (pp_dynamic_chunking).
-        pp_step = (
-            PPChunkStep(self.pp_chunk_planner)
-            if self.pp_chunk_planner is not None
-            else None
-        )
+        pp_step = None
+        if self.pp_chunk_planner is not None:
+            pp_step = PPChunkStep(
+                self.pp_chunk_planner,
+                self.pp_chunk_planner.queue_target_time(
+                    itertools.chain(self.running, self.waiting)
+                ),
+            )
 
         # For logging.
         scheduled_timestamp = time.monotonic()
