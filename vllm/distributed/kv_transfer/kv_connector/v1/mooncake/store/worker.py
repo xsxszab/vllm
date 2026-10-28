@@ -1084,6 +1084,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # are only unique within a group, so failures are reported per request.
         self._is_hma_required = is_hma_required
         self._failed_requests: set[str] = set()
+        # Requests with any load error, kept until they are popped as finished.
+        self._load_error_requests: set[str] = set()
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
             None
@@ -1108,7 +1110,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._failed_requests.clear()
         return failed
 
+    def get_and_clear_finished_requests(self) -> set[str]:
+        loaded, with_errors = self.pop_finished_requests()
+        return loaded | with_errors
+
+    def pop_finished_requests(self) -> tuple[set[str], set[str]]:
+        """Pop finished loads as (loaded without errors, loaded with errors)."""
+        with self.done_task_lock:
+            finished, self.finished_requests = self.finished_requests, set()
+            with_errors = finished & self._load_error_requests
+            self._load_error_requests -= with_errors
+        return finished - with_errors, with_errors
+
     def _report_load_error(self, req_id: str, block_ids: list[int]) -> None:
+        # Marked before the request is set finished, so a finished request
+        # is never popped as loaded without errors.
+        with self.done_task_lock:
+            self._load_error_requests.add(req_id)
         if self._is_hma_required:
             self.set_failed_request(req_id)
         else:
@@ -1492,6 +1510,12 @@ class MooncakeStoreWorker:
         self.kv_recv_threads: list[KVCacheStoreRecvingThread] = []
         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
+        self.early_recv = vllm_config.kv_transfer_config.enable_early_recv
+        # With early receive: queued loads not yet popped as finished, and
+        # finished loads held for the path that reports them.
+        self._loading_req_ids: set[str] = set()
+        self._loaded_req_ids: set[str] = set()
+        self._loaded_with_errors_req_ids: set[str] = set()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
@@ -1950,6 +1974,8 @@ class MooncakeStoreWorker:
                 continue
 
             load_spec.token_len = load_spec.kvpool_cached_tokens
+            if self.early_recv:
+                self._loading_req_ids.add(request.req_id)
             self.recv_request_queue.put(request)
 
         assert self.load_async, "load_async must be True for better performance."
@@ -1994,7 +2020,14 @@ class MooncakeStoreWorker:
         # on a `finished_sending` signal to get its blocks back.
         done_sending: set[str] = set()
         done_recving: set[str] = set()
-        if self.load_async:
+        if self.early_recv:
+            # Loads without errors are reported by poll_finished_recving().
+            self._pop_finished_loads()
+            done_recving, self._loaded_with_errors_req_ids = (
+                self._loaded_with_errors_req_ids,
+                set(),
+            )
+        elif self.load_async:
             for recv_thread in self.kv_recv_threads:
                 done_recving |= recv_thread.get_and_clear_finished_requests()
 
@@ -2005,6 +2038,29 @@ class MooncakeStoreWorker:
             self.tp_rank,
         )
         return done_sending, done_recving
+
+    def _pop_finished_loads(self) -> None:
+        for recv_thread in self.kv_recv_threads:
+            loaded, with_errors = recv_thread.pop_finished_requests()
+            self._loaded_req_ids |= loaded
+            self._loaded_with_errors_req_ids |= with_errors
+            self._loading_req_ids -= loaded | with_errors
+
+    def has_pending_recving(self) -> bool:
+        return bool(self._loading_req_ids or self._loaded_req_ids)
+
+    def poll_finished_recving(self) -> set[str]:
+        """Pop the loads that finished without errors.
+
+        Loads with errors stay on the get_finished() path, which reports them
+        in the same step output as, or after, their invalid block ids or
+        failed requests.
+        """
+        if not self.has_pending_recving():
+            return set()
+        self._pop_finished_loads()
+        loaded, self._loaded_req_ids = self._loaded_req_ids, set()
+        return loaded
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         block_ids: set[int] = set()
