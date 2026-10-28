@@ -19,7 +19,7 @@ import json
 import logging
 import math
 import statistics
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -240,7 +240,11 @@ class PPChunkPlanner:
             return self.cost.o * self.pp_size
         return W + W * self.cost.o / (T - self.cost.o) + (self.pp_size - 1) * T
 
-    def queue_target_time(self, queue: Iterable["Request"]) -> float:
+    def queue_target_time(
+        self,
+        queue: Iterable["Request"],
+        computed_tokens: Callable[["Request"], int] | None = None,
+    ) -> float:
         """Step target (ms) minimizing the mean TTFT of the queued prefills.
 
         Under FCFS with equal-time steps, the ``j``-th queued prefill gets its
@@ -250,10 +254,12 @@ class PPChunkPlanner:
         ``W`` replaced by the mean of ``W_j``, which grows with the backlog and
         so trades the pipeline fill of the head request for throughput.
 
-        Prefix cache hits of requests not admitted yet are unknown, so their
-        work is overestimated. The scan stops once the head request's chunk
-        alone would fill the token budget. Returns 0 with fewer than two
-        queued prefills, leaving a lone request at its own target.
+        ``computed_tokens`` gives the prefix each request starts from, so that
+        waiting requests can be credited with their expected prefix-cache
+        hits; it defaults to ``num_computed_tokens``. The scan stops once the
+        head request's chunk alone would fill the token budget. Returns 0 with
+        fewer than two queued prefills, leaving a lone request at its own
+        target.
         """
         if self.pp_size <= 1:
             return 0.0
@@ -263,7 +269,11 @@ class PPChunkPlanner:
         sum_cum_work = 0.0
         full_step_work = math.inf
         for request in queue:
-            L = request.num_computed_tokens
+            L = (
+                computed_tokens(request)
+                if computed_tokens is not None
+                else request.num_computed_tokens
+            )
             if not _is_prefill(request, L):
                 continue
             N = request.num_tokens

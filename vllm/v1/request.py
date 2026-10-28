@@ -202,6 +202,8 @@ class Request:
         # Per-chunk time target under pp_dynamic_chunking; set when the first
         # chunk is scheduled and reset on preemption, since the prefix changes.
         self.pp_chunk_target_ms: float | None = None
+        # Local prefix-cache hit estimated while waiting, for the queue target.
+        self.pp_chunk_est_cached_tokens: int | None = None
 
         # Block-aligned token position of a proven shared prefix worth pinning
         # in the (sparse) prefix cache; 0 means none. Set at admission for

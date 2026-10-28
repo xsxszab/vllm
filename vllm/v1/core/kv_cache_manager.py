@@ -252,6 +252,16 @@ class KVCacheManager:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and not request.skip_reading_prefix_cache
 
+    def peek_num_cached_tokens(self, request: Request) -> int:
+        """Local prefix-cache hit length of a request, without recording stats,
+        emitting events or taking block references."""
+        if not self.prefix_cache_lookup_enabled(request):
+            return 0
+        _, num_cached_tokens, _ = self.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        return num_cached_tokens
+
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.
         if not self.log_stats or not self.prefix_cache_lookup_enabled(request):

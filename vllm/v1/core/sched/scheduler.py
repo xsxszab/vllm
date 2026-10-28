@@ -753,7 +753,8 @@ class Scheduler(SchedulerInterface):
             pp_step = PPChunkStep(
                 self.pp_chunk_planner,
                 self.pp_chunk_planner.queue_target_time(
-                    itertools.chain(self.running, self.waiting)
+                    itertools.chain(self.running, self.waiting),
+                    self._pp_queue_computed_tokens,
                 ),
             )
 
@@ -1819,6 +1820,19 @@ class Scheduler(SchedulerInterface):
             return None
         return new_block_ids_to_zero or None
 
+    def _pp_queue_computed_tokens(self, request: Request) -> int:
+        """Prefix a queued request starts from, for the pp_dynamic_chunking
+        queue target. A waiting request's local prefix-cache hit is looked up
+        once and reused while it waits; external (connector) hits are unknown
+        and not counted."""
+        if request.num_computed_tokens > 0:
+            return request.num_computed_tokens
+        if request.pp_chunk_est_cached_tokens is None:
+            request.pp_chunk_est_cached_tokens = (
+                self.kv_cache_manager.peek_num_cached_tokens(request)
+            )
+        return request.pp_chunk_est_cached_tokens
+
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
     ) -> None:
@@ -1844,6 +1858,7 @@ class Scheduler(SchedulerInterface):
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         request.pp_chunk_target_ms = None
+        request.pp_chunk_est_cached_tokens = None
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are

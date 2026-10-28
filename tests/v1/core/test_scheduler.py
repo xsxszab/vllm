@@ -8906,17 +8906,17 @@ def test_pp_dynamic_chunking_single_long_prefill(monkeypatch):
     assert len(chunks) == 157
 
 
-def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
-    """A prefix cache hit shortens the remaining work, so T is computed from
-    the hit length, not from zero."""
-    scheduler, planner = _pp_chunk_scheduler(monkeypatch, enable_prefix_caching=True)
-    (req_a,) = create_requests(
-        num_requests=1, num_tokens=32 * 1024, max_tokens=1, req_ids=["a"]
+def _cache_prompt(scheduler, num_tokens: int) -> None:
+    """Run one request to completion so its prompt lands in the prefix cache.
+    It shares its prompt tokens with later requests created at index 0 or
+    with same_prompt=True."""
+    (req,) = create_requests(
+        num_requests=1, num_tokens=num_tokens, max_tokens=1, req_ids=["a"]
     )
-    scheduler.add_request(req_a)
-    while not req_a.is_finished():
+    scheduler.add_request(req)
+    while not req.is_finished():
         output = scheduler.schedule()
-        sampled = req_a.num_computed_tokens >= req_a.num_prompt_tokens
+        sampled = req.num_computed_tokens >= req.num_prompt_tokens
         scheduler.update_from_output(
             output,
             ModelRunnerOutput(
@@ -8929,7 +8929,12 @@ def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
             ),
         )
 
-    # Same prompt tokens as "a" for the first 32K.
+
+def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
+    """A prefix cache hit shortens the remaining work, so T is computed from
+    the hit length, not from zero."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch, enable_prefix_caching=True)
+    _cache_prompt(scheduler, 32 * 1024)
     (req_b,) = create_requests(
         num_requests=1, num_tokens=64 * 1024, max_tokens=1, req_ids=["b"]
     )
@@ -8944,6 +8949,41 @@ def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
         output.num_scheduled_tokens["b"]
         == planner.plan(req_b.num_prompt_tokens, hit)[0]
     )
+
+
+def test_pp_dynamic_chunking_queue_target_credits_waiting_prefix_hit(monkeypatch):
+    """Agentic backlog: waiting turns that mostly hit the prefix cache count
+    only their uncached tail toward the queue target, so the step target is
+    not inflated as if every prompt were prefilled from scratch. Each waiting
+    request's hit is looked up once."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch, enable_prefix_caching=True)
+    hit = 32 * 1024
+    _cache_prompt(scheduler, hit)
+    reqs = create_requests(
+        num_requests=2,
+        num_tokens=hit + 2048,
+        max_tokens=1,
+        req_ids=["b", "c"],
+        same_prompt=True,
+    )
+    for req in reqs:
+        scheduler.add_request(req)
+
+    kv_cache_manager = scheduler.kv_cache_manager
+    peek = kv_cache_manager.peek_num_cached_tokens
+    lookups: list[str] = []
+
+    def counting_peek(request):
+        lookups.append(request.request_id)
+        return peek(request)
+
+    monkeypatch.setattr(kv_cache_manager, "peek_num_cached_tokens", counting_peek)
+    queue = list(scheduler.waiting)
+    T = planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
+    assert pytest.approx(planner.queue_target_time(queue, lambda r: hit)) == T
+    assert planner.queue_target_time(queue) > T
+    planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
+    assert lookups == ["b", "c"]
 
 
 def _tail_budget_ms(planner, N: int) -> float:
