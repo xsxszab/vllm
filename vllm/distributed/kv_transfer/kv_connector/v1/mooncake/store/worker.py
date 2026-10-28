@@ -17,6 +17,7 @@ import queue
 import socket
 import threading
 import time
+import zlib
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
@@ -1095,6 +1096,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+        # EXPERIMENT ONLY (not for upstream): every load this thread finished,
+        # and whether to fail every Nth load (set by the worker).
+        self.trace_completed: set[str] = set()
+        self.trace_inject_fail_every = 0
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1120,6 +1125,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 os.getpid(),
                 req_id in self._load_error_requests,
             )
+            with self.done_task_lock:
+                self.trace_completed.add(req_id)
         super().set_finished_request(req_id)
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -1338,6 +1345,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 e,
             )
 
+        # EXPERIMENT ONLY (not for upstream): fail every Nth load after it ran,
+        # so the request must take the regular, error-reporting path.
+        n = self.trace_inject_fail_every
+        if n and block_id_list_c and zlib.crc32(req_id.encode()) % n == 0:
+            logger.info("EARLY_RECV_TRACE inject_fail %s %.6f", req_id, time.time())
+            self._report_load_error(req_id, block_id_list_c[:1])
+
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 
@@ -1528,6 +1542,12 @@ class MooncakeStoreWorker:
         self._loading_req_ids: set[str] = set()
         self._loaded_req_ids: set[str] = set()
         self._loaded_with_errors_req_ids: set[str] = set()
+        # EXPERIMENT ONLY (not for upstream): first-run invariant check and the
+        # negative control that reports loads early before they finish.
+        self._trace = os.environ.get("VLLM_EARLY_RECV_TRACE") == "1"
+        self._trace_issued_loads: set[str] = set()
+        self._trace_negctrl =os.environ.get("VLLM_EARLY_RECV_NEGCTRL") == "1"
+        self._trace_negctrl_reported: set[str] = set()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
@@ -1960,6 +1980,12 @@ class MooncakeStoreWorker:
                 ],
                 is_hma_required=self._is_hma_required,
             )
+            # EXPERIMENT ONLY (not for upstream): inject failures on the last PP
+            # rank only, so the other ranks still report the same loads early.
+            if self.pp_rank == self.pp_size - 1:
+                recv_thread.trace_inject_fail_every = int(
+                    os.environ.get("VLLM_EARLY_RECV_INJECT_FAIL_EVERY", "0")
+                )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
@@ -1988,6 +2014,9 @@ class MooncakeStoreWorker:
             load_spec.token_len = load_spec.kvpool_cached_tokens
             if self.early_recv:
                 self._loading_req_ids.add(request.req_id)
+            # EXPERIMENT ONLY (not for upstream): loads to verify at first run.
+            if self._trace:
+                self._trace_issued_loads.add(request.req_id)
             self.recv_request_queue.put(request)
 
         assert self.load_async, "load_async must be True for better performance."
@@ -2072,7 +2101,33 @@ class MooncakeStoreWorker:
             return set()
         self._pop_finished_loads()
         loaded, self._loaded_req_ids = self._loaded_req_ids, set()
+        if self._trace_negctrl:
+            # Report queued loads as finished right away, and each only once.
+            loaded -= self._trace_negctrl_reported
+            fake = self._loading_req_ids - self._trace_negctrl_reported
+            self._trace_negctrl_reported |= fake
+            loaded |= fake
         return loaded
+
+    def trace_check_first_run(self, req_ids: list[str]) -> None:
+        """EXPERIMENT ONLY (not for upstream): a request whose load this rank
+        issued must find the load finished on this rank when it first runs."""
+        done: set[str] = set()
+        for recv_thread in self.kv_recv_threads:
+            with recv_thread.done_task_lock:
+                done |= recv_thread.trace_completed
+        now = time.time()
+        for req_id in req_ids:
+            if req_id not in self._trace_issued_loads:
+                continue
+            self._trace_issued_loads.discard(req_id)
+            logger.info(
+                "EARLY_RECV_TRACE %s %s %.6f pp_rank=%d",
+                "check_ok" if req_id in done else "check_VIOLATION",
+                req_id,
+                now,
+                self.pp_rank,
+            )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         block_ids: set[int] = set()

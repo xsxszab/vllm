@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -85,6 +86,8 @@ class ActiveKVConnector(KVConnector):
         assert kv_connector_metadata is not None
         self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
+        if os.environ.get("VLLM_EARLY_RECV_TRACE") == "1":
+            self._trace_check_first_run(scheduler_output)
         self._pending_load_kwargs = self._build_load_kwargs(
             scheduler_output, input_batch, attn_metadata
         )
@@ -94,6 +97,19 @@ class ActiveKVConnector(KVConnector):
             self._start_load_kv()
         # Otherwise start the async load after forward to keep submission
         # off the critical path.
+
+    def _trace_check_first_run(self, scheduler_output: "SchedulerOutput") -> None:
+        # EXPERIMENT ONLY (not for upstream): before a request first runs, its
+        # load must have finished on this rank.
+        req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
+        req_ids += list(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+        if not req_ids:
+            return
+        connectors = getattr(self.kv_connector, "_connectors", [self.kv_connector])
+        for connector in connectors:
+            worker = getattr(connector, "connector_worker", None)
+            if hasattr(worker, "trace_check_first_run"):
+                worker.trace_check_first_run(req_ids)
 
     @staticmethod
     def _build_load_kwargs(
