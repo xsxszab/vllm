@@ -3657,6 +3657,8 @@ class Scheduler(SchedulerInterface):
 
                 affected_req_ids.add(request.request_id)
 
+        if _EARLY_RECV_TRACE and affected_req_ids:
+            _trace("invalid_seen", affected_req_ids)
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
