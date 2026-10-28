@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -81,6 +82,17 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# EXPERIMENT ONLY (not for upstream): wall-clock trace of KV load completion
+# signals, parsed offline. All processes run on one node, so time.time() is
+# comparable across them.
+_EARLY_RECV_TRACE = os.environ.get("VLLM_EARLY_RECV_TRACE") == "1"
+
+
+def _trace(event: str, req_ids: Iterable[str] = ("-",), extra: str = "") -> None:
+    now = time.time()
+    for req_id in req_ids:
+        logger.info("EARLY_RECV_TRACE %s %s %.6f %s", event, req_id, now, extra)
 
 
 class Scheduler(SchedulerInterface):
@@ -2248,6 +2260,12 @@ class Scheduler(SchedulerInterface):
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        if _EARLY_RECV_TRACE:
+            _trace(
+                "step_output",
+                extra=f"tokens={scheduler_output.total_num_scheduled_tokens}",
+            )
+
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
@@ -2552,6 +2570,8 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
+            if _EARLY_RECV_TRACE and kv_connector_output.finished_recving:
+                _trace("t2_step_output", kv_connector_output.finished_recving)
             self._update_from_kv_xfer_finished(kv_connector_output)
 
         # EC Connector: update state from worker-side EC connector output.
@@ -3471,6 +3491,8 @@ class Scheduler(SchedulerInterface):
                 logger.debug("%s is still in WAITING_FOR_REMOTE_KVS state.", request_id)
                 return False
             # Promote request to waiting or preempted.
+            if _EARLY_RECV_TRACE:
+                _trace("t3_promoted", (request_id,))
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
@@ -3499,6 +3521,8 @@ class Scheduler(SchedulerInterface):
         return True
 
     def add_finished_recving(self, request_ids: set[str]) -> None:
+        if _EARLY_RECV_TRACE:
+            _trace("t2_early", request_ids)
         self._update_from_kv_xfer_finished(
             KVConnectorOutput(finished_recving=request_ids)
         )
