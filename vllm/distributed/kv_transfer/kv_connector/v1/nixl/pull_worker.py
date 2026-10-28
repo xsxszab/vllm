@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -58,6 +59,25 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._early_finished_recving = set()
         # Registration generation of each remote engine's loaded agent.
         self._remote_registration_generations: dict[EngineId, int] = {}
+
+    def _pop_done_transfers(
+        self, transfers: dict[str, list[int]]
+    ) -> tuple[set[str], set[str]]:
+        # EXPERIMENT ONLY (not for upstream): when this worker observed each
+        # pull finish. NIXL completion is only seen when polled, so this is an
+        # observation time, not the transfer's true end.
+        done, failed = super()._pop_done_transfers(transfers)
+        if done and os.environ.get("VLLM_EARLY_RECV_TRACE") == "1":
+            now = time.time()
+            for req_id in done:
+                logger.info(
+                    "EARLY_RECV_TRACE t1_nixl_observed %s %.6f pid=%d errors=%s",
+                    req_id,
+                    now,
+                    os.getpid(),
+                    req_id in failed,
+                )
+        return done, failed
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
         results = super().get_transfer_results()
