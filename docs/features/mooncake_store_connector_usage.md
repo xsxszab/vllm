@@ -299,6 +299,19 @@ Tensor-parallel collectives and low-precision arithmetic are not bitwise
 invariant across TP sizes, so heterogeneous-TP reuse does not guarantee the
 same greedy output as recomputing the prefix at the decode TP size.
 
+### Early Load Reporting
+
+Set `"enable_early_recv": true` at the top level of `--kv-transfer-config`
+(not in `kv_connector_extra_config`) to report loads that completed without
+errors before the next step output, so the scheduler can run their requests in
+its next step. Without it, a completion reaches the scheduler with the output
+of a step that is still running on the GPU, which with pipeline parallelism
+delays the request by about one pipeline depth. Loads with errors keep the
+regular path. It requires `kv_consumer` or `kv_both` and the `uni` executor or
+the `mp` executor with all workers on one node; PP is supported. See
+[Early receive reporting](nixl_connector_usage.md#early-receive-reporting) for
+how workers poll and report. Disabled by default.
+
 ## Notes
 
 ### Reproducible Block Hashes Across Processes

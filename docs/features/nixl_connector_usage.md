@@ -415,9 +415,9 @@ Support use case: Prefill with `LBHNC` and decode with `LBNHC` with experimental
 Set `"enable_early_recv": true` in the decoder's `--kv-transfer-config` to report
 completed KV loads before the next step output. It works with the `uni` executor
 and with the `mp` executor when all workers are on the same node, with async or
-synchronous scheduling. PP must be 1: NIXL pull does not support decoder PP.
-NIXL pull connectors support this path, including inside MultiConnector.
-Other connectors retain their normal behavior.
+synchronous scheduling. NIXL pull does not support decoder PP.
+NIXL pull connectors and MooncakeStoreConnector support this path, including
+inside MultiConnector. Other connectors retain their normal behavior.
 Early and ordinary notifications share the same all-worker completion count.
 
 With the `mp` executor each worker polls its receives after the step's

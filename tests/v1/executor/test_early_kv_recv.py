@@ -143,10 +143,16 @@ def test_broken_error_channel_terminates_worker(receiver):
 
 
 @pytest.mark.parametrize(
-    ("backend", "async_scheduling", "pp", "accepted"),
-    [("mp", True, 1, True), ("uni", False, 1, True), ("mp", True, 2, False)],
+    ("backend", "async_scheduling", "pp", "kv_role", "accepted"),
+    [
+        ("mp", True, 1, "kv_consumer", True),
+        ("uni", False, 1, "kv_consumer", True),
+        # PP support is up to the connector, e.g. MooncakeStoreConnector.
+        ("mp", True, 2, "kv_both", True),
+        ("mp", True, 1, "kv_producer", False),
+    ],
 )
-def test_early_recv_config(backend, async_scheduling, pp, accepted):
+def test_early_recv_config(backend, async_scheduling, pp, kv_role, accepted):
     def build():
         return VllmConfig(
             model_config=ModelConfig(model="facebook/opt-125m"),
@@ -160,7 +166,7 @@ def test_early_recv_config(backend, async_scheduling, pp, accepted):
             ),
             kv_transfer_config=KVTransferConfig(
                 kv_connector="NixlConnector",
-                kv_role="kv_consumer",
+                kv_role=kv_role,
                 enable_early_recv=True,
             ),
             device_config=DeviceConfig("cpu"),
