@@ -1112,6 +1112,19 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._failed_requests.clear()
         return failed
 
+    def set_finished_request(self, req_id: str):
+        # EXPERIMENT ONLY (not for upstream): t1 of the load completion trace.
+        if os.environ.get("VLLM_EARLY_RECV_TRACE") == "1":
+            logger.info(
+                "EARLY_RECV_TRACE t1_loaded %s %.6f pid=%d errors=%s",
+                req_id,
+                time.time(),
+                os.getpid(),
+                self._load_error_requests is not None
+                and req_id in self._load_error_requests,
+            )
+        super().set_finished_request(req_id)
+
     def pop_finished_requests(self) -> tuple[set[str], set[str]]:
         """Pop finished loads as (loaded without errors, loaded with errors)."""
         assert self._load_error_requests is not None
