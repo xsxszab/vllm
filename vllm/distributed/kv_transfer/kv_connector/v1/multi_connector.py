@@ -186,6 +186,8 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             self._connectors.append(connector_cls(temp_config, role, kv_cache_config))
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
+        # Children that report receives through polling, i.e. not by a notifier.
+        self._polled_connectors = list(self._connectors)
 
         assert vllm_config.kv_transfer_config is not None
         self._all_support_hma = MultiConnector.all_children_support_hma(
@@ -396,10 +398,21 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         return results
 
     def has_pending_recving(self) -> bool:
-        return any(c.has_pending_recving() for c in self._connectors)
+        return any(c.has_pending_recving() for c in self._polled_connectors)
 
     def poll_finished_recving(self) -> set[str]:
-        return set().union(*(c.poll_finished_recving() for c in self._connectors))
+        return set().union(
+            *(c.poll_finished_recving() for c in self._polled_connectors)
+        )
+
+    def set_early_recv_notifier(
+        self, notifier: Callable[[set[str]], None] | None
+    ) -> bool:
+        # Decided per child: a pushing child must not stop polling the others.
+        self._polled_connectors = [
+            c for c in self._connectors if not c.set_early_recv_notifier(notifier)
+        ]
+        return not self._polled_connectors
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         agg_block_ids: set[int] = set()

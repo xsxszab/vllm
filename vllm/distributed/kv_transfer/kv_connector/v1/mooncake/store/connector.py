@@ -12,7 +12,7 @@ enabling prefix caching via hash-based deduplication.
 """
 
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager
 from typing import Any
 
@@ -393,6 +393,14 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def poll_finished_recving(self) -> set[str]:
         assert self.connector_worker is not None
         return self.connector_worker.poll_finished_recving()
+
+    def set_early_recv_notifier(
+        self, notifier: Callable[[set[str]], None] | None
+    ) -> bool:
+        return (
+            self.connector_worker is not None
+            and self.connector_worker.set_early_recv_notifier(notifier)
+        )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         assert self.connector_worker is not None

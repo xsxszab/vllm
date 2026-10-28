@@ -3726,6 +3726,7 @@ def _make_bare_worker(
     worker._loading_req_ids = set()
     worker._loaded_req_ids = set()
     worker._loaded_with_errors_req_ids = set()
+    worker._early_notifier = None
     worker.finished_store_req = set()
     worker.tp_size = 1
     worker.store_tp_size = None
@@ -4620,6 +4621,34 @@ def test_early_recv_reports_only_error_free_loads_early(is_hma_required):
     assert w.poll_finished_recving() == {"late"}
     assert not w.has_pending_recving()
     assert w.poll_finished_recving() == set()
+
+
+@pytest.mark.cpu_test
+def test_early_recv_push_sends_error_free_loads_once():
+    """With a notifier, the receive thread sends each error-free load once
+    itself and nothing is left for the poll; loads with errors stay regular."""
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.side_effect = [[-1, 0], [0, 0]]
+    recv_thread = _make_store_recving_thread(store)
+    w = _make_bare_worker(kv_role="kv_consumer", early_recv=True)
+    w._trace = w._trace_negctrl = False
+    w.kv_recv_threads = [recv_thread]
+    pushed: list[set[str]] = []
+    assert w.set_early_recv_notifier(pushed.append)
+    meta = mooncake_store_worker.MooncakeStoreConnectorMetadata(set(), set())
+    for req_id in ("bad", "good"):
+        meta.add_request(_make_load_req(req_id, [b"h0", b"h1"], token_len=32))
+
+    w.start_load_kv(meta)
+    assert not w.has_pending_recving()
+    for _ in range(2):
+        recv_thread._handle_request(w.recv_request_queue.get_nowait())
+
+    assert pushed == [{"good"}]
+    assert w.poll_finished_recving() == set()
+    assert w.get_transfer_results(set(), meta).finished_recving == {"bad"}
+    assert w.get_block_ids_with_load_errors() == {0}
+    assert not w.has_pending_recving()
 
 
 def test_putting_consumer_queues_decode_save():

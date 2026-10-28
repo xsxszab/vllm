@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import multiprocessing
+import threading
 import time
 from contextlib import closing, suppress
 
 import pytest
 
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.executor import early_kv_recv
 from vllm.v1.executor.early_kv_recv import (
     EarlyKVOutputAggregator,
@@ -28,6 +30,14 @@ class _PendingConnector:
         if self.error is not None:
             raise self.error
         return self.done
+
+    def set_early_recv_notifier(self, notifier) -> bool:
+        return False
+
+
+class _PushingConnector(_PendingConnector):
+    def set_early_recv_notifier(self, notifier) -> bool:
+        return notifier is not None
 
 
 @pytest.fixture
@@ -85,6 +95,36 @@ def test_sender_stops_polling_when_idle_or_shut_down(monkeypatch, rpc_queue, rec
         assert sender.wait_for_poll(reader)
         reader.shutdown()
         assert not sender.wait_for_poll(reader)
+
+
+@pytest.mark.timeout(10)
+def test_sender_takes_pushes_from_connector_threads(monkeypatch, receiver):
+    """Each pushing thread sends on its own socket; nothing after close()."""
+    with closing(_sender(monkeypatch, _PendingConnector(), receiver.path)) as sender:
+        threads = [
+            threading.Thread(target=sender.notify, args=({f"r{i}"},)) for i in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        received: list[set[str]] = []
+        deadline = time.monotonic() + 5
+        while len(received) < 2 and time.monotonic() < deadline:
+            received.extend(receiver.drain())
+        assert sorted(received, key=min) == [{"r0"}, {"r1"}]
+    sender.notify({"late"})
+    assert receiver.drain() == []
+
+
+def test_multi_connector_polls_only_children_without_notifier():
+    """A pushing child must not stop the others from being polled."""
+    multi = object.__new__(MultiConnector)
+    multi._connectors = [_PendingConnector({"nixl"}), _PushingConnector({"store"})]
+    assert not multi.set_early_recv_notifier(lambda _: None)
+    assert multi.poll_finished_recving() == {"nixl"}
+    assert not multi.set_early_recv_notifier(None)
+    assert multi.poll_finished_recving() == {"nixl", "store"}
 
 
 def _poll_with_failure(path, broken_channel):

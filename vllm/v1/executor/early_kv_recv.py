@@ -3,6 +3,7 @@
 """Report completed KV pulls between model outputs and the next schedule()."""
 
 import os
+import threading
 import time
 
 import torch
@@ -73,7 +74,15 @@ class EarlyKVRecvSender:
     """Worker end: polls the KV connector between RPCs."""
 
     def __init__(self, path: str) -> None:
+        self._path = path
         self._socket = make_zmq_socket(zmq.Context.instance(), path, zmq.PUSH)
+        # notify() callers own one socket each: ZMQ sockets are not thread-safe.
+        self._thread_sockets = threading.local()
+        self._closed = False
+        # EXPERIMENT ONLY (not for upstream): push instead of poll for
+        # connectors that support it, installed once the connector exists.
+        self._push = os.environ.get("VLLM_EARLY_RECV_PUSH") == "1"
+        self._push_installed = False
         self._last_activity = time.perf_counter()
         self._next_poll = 0.0
         # EXPERIMENT ONLY (not for upstream): disable the between-RPC wait, and
@@ -115,6 +124,7 @@ class EarlyKVRecvSender:
 
     def wait_for_poll(self, rpc_mq: MessageQueue) -> bool:
         """Wait briefly for a pending receive, yielding to queued RPCs."""
+        self._maybe_install_notifier()
         if self._trace_no_spin:
             return False
         if not has_kv_transfer_group() or rpc_mq.shutting_down or rpc_mq.readable():
@@ -155,5 +165,32 @@ class EarlyKVRecvSender:
             # to back.
             self._next_poll = time.perf_counter() + _POLL_INTERVAL_S
 
+    def _maybe_install_notifier(self) -> None:
+        if self._push and not self._push_installed and has_kv_transfer_group():
+            pushes = get_kv_transfer_group().set_early_recv_notifier(self.notify)
+            logger.info("Early KV receive: connector pushes all receives: %s", pushes)
+            self._push_installed = True
+
+    def notify(self, req_ids: set[str]) -> None:
+        """Connector thread: send receives the connector pushes, see
+        `KVConnectorBase_V1.set_early_recv_notifier()`."""
+        if self._closed:
+            return
+        try:
+            socket = getattr(self._thread_sockets, "socket", None)
+            if socket is None:
+                socket = make_zmq_socket(zmq.Context.instance(), self._path, zmq.PUSH)
+                self._thread_sockets.socket = socket
+            socket.send_pyobj(req_ids)
+        except Exception:
+            logger.exception("Early KV receive notification failed")
+            # As in poll(): the receive is no longer reported on any path.
+            os._exit(1)
+
     def close(self) -> None:
+        # Sockets of notify() callers belong to their threads and close at
+        # process exit; a receive finishing during shutdown is not reported.
+        self._closed = True
+        if self._push_installed and has_kv_transfer_group():
+            get_kv_transfer_group().set_early_recv_notifier(None)
         self._socket.close(linger=0)

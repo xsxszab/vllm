@@ -442,6 +442,18 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def set_early_recv_notifier(
+        self, notifier: Callable[[set[str]], None] | None
+    ) -> bool:
+        """Let the connector push successful receives instead of being polled.
+
+        `notifier` may be called from any connector thread, with the same
+        contract as `poll_finished_recving()`; the worker no longer polls a
+        connector that returns True. None uninstalls it before shutdown, after
+        which completions go back to `poll_finished_recving()`.
+        """
+        return False
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get the set of block IDs that failed to load.
 

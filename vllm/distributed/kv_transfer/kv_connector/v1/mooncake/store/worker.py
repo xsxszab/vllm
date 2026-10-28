@@ -1101,6 +1101,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+        # Set by the worker; pushes loads without errors as they finish.
+        self.early_notifier: Callable[[set[str]], None] | None = None
         # EXPERIMENT ONLY (not for upstream): every load this thread finished,
         # and whether to fail every Nth load (set by the worker).
         self.trace_completed: set[str] = set()
@@ -1137,7 +1139,24 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
             with self.done_task_lock:
                 self.trace_completed.add(req_id)
-        super().set_finished_request(req_id)
+        # Errors are marked before this call, and the KV is in place: loads
+        # complete synchronously in this thread. Ownership moves under the
+        # lock, so a pushed load never reaches pop_finished_requests(); the
+        # send happens outside it.
+        with self.done_task_lock:
+            notifier = self.early_notifier
+            if notifier is None or req_id in self._load_error_requests:
+                self.finished_requests.add(req_id)
+                return
+        # EXPERIMENT ONLY (not for upstream): same event as a polled send.
+        if os.environ.get("VLLM_EARLY_RECV_TRACE") == "1":
+            logger.info(
+                "EARLY_RECV_TRACE early_sent %s %.6f pp_rank=%d",
+                req_id,
+                time.time(),
+                self.trace_pp_rank,
+            )
+        notifier({req_id})
 
     def get_and_clear_finished_requests(self) -> set[str]:
         loaded, with_errors = self.pop_finished_requests()
@@ -1600,6 +1619,8 @@ class MooncakeStoreWorker:
         self._loading_req_ids: set[str] = set()
         self._loaded_req_ids: set[str] = set()
         self._loaded_with_errors_req_ids: set[str] = set()
+        # Pushes loads without errors from the receive threads instead.
+        self._early_notifier: Callable[[set[str]], None] | None = None
         # EXPERIMENT ONLY (not for upstream): first-run invariant check and the
         # negative control that reports loads early before they finish.
         self._trace = os.environ.get("VLLM_EARLY_RECV_TRACE") == "1"
@@ -2058,6 +2079,7 @@ class MooncakeStoreWorker:
                     "VLLM_EARLY_RECV_INJECT_MISSING", ""
                 )
             recv_thread.trace_pp_rank = self.pp_rank
+            recv_thread.early_notifier = self._early_notifier
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
@@ -2084,7 +2106,9 @@ class MooncakeStoreWorker:
                 continue
 
             load_spec.token_len = load_spec.kvpool_cached_tokens
-            if self.early_recv:
+            if self.early_recv and self._early_notifier is None:
+                # Pushed loads never reach the poll, so tracking them would keep
+                # has_pending_recving() true and the worker polling.
                 self._loading_req_ids.add(request.req_id)
             # EXPERIMENT ONLY (not for upstream): loads to verify at first run.
             if self._trace:
@@ -2163,6 +2187,22 @@ class MooncakeStoreWorker:
 
     def has_pending_recving(self) -> bool:
         return bool(self._loading_req_ids or self._loaded_req_ids)
+
+    def set_early_recv_notifier(
+        self, notifier: Callable[[set[str]], None] | None
+    ) -> bool:
+        """Push loads without errors from the receive threads.
+
+        Installed before the first load. Uninstalling is for shutdown only:
+        loads in flight then are not reported early.
+        """
+        if not self.early_recv:
+            return False
+        self._early_notifier = notifier
+        for recv_thread in self.kv_recv_threads:
+            with recv_thread.done_task_lock:
+                recv_thread.early_notifier = notifier
+        return notifier is not None
 
     def poll_finished_recving(self) -> set[str]:
         """Pop the loads that finished without errors.
