@@ -1102,6 +1102,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # and whether to fail every Nth load (set by the worker).
         self.trace_completed: set[str] = set()
         self.trace_inject_fail_every = 0
+        self.trace_injected: set[str] = set()
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1346,10 +1347,18 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 e,
             )
 
-        # EXPERIMENT ONLY (not for upstream): fail every Nth load after it ran,
-        # so the request must take the regular, error-reporting path.
+        # EXPERIMENT ONLY (not for upstream): fail every Nth request's first
+        # load after it ran, so it must take the regular, error-reporting path.
+        # Only the first: a recomputed request may load again, and failing
+        # every attempt would loop forever.
         n = self.trace_inject_fail_every
-        if n and block_id_list_c and zlib.crc32(req_id.encode()) % n == 0:
+        if (
+            n
+            and block_id_list_c
+            and req_id not in self.trace_injected
+            and zlib.crc32(req_id.encode()) % n == 0
+        ):
+            self.trace_injected.add(req_id)
             logger.info("EARLY_RECV_TRACE inject_fail %s %.6f", req_id, time.time())
             self._report_load_error(req_id, block_id_list_c[:1])
 
@@ -2070,6 +2079,8 @@ class MooncakeStoreWorker:
                 self._loaded_with_errors_req_ids,
                 set(),
             )
+            if self._trace:
+                self._trace_sent("regular_sent", done_recving)
         elif self.load_async:
             for recv_thread in self.kv_recv_threads:
                 done_recving |= recv_thread.get_and_clear_finished_requests()
@@ -2109,7 +2120,21 @@ class MooncakeStoreWorker:
             fake = self._loading_req_ids - self._trace_negctrl_reported
             self._trace_negctrl_reported |= fake
             loaded |= fake
+        if self._trace:
+            self._trace_sent("early_sent", loaded)
         return loaded
+
+    def _trace_sent(self, event: str, req_ids: set[str]) -> None:
+        """EXPERIMENT ONLY (not for upstream): which path this rank used."""
+        now = time.time()
+        for req_id in req_ids:
+            logger.info(
+                "EARLY_RECV_TRACE %s %s %.6f pp_rank=%d",
+                event,
+                req_id,
+                now,
+                self.pp_rank,
+            )
 
     def trace_check_first_run(self, req_ids: list[str]) -> None:
         """EXPERIMENT ONLY (not for upstream): a request whose load this rank
