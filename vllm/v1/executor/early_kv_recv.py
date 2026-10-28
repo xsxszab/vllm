@@ -76,6 +76,38 @@ class EarlyKVRecvSender:
         self._socket = make_zmq_socket(zmq.Context.instance(), path, zmq.PUSH)
         self._last_activity = time.perf_counter()
         self._next_poll = 0.0
+        # EXPERIMENT ONLY (not for upstream): disable the between-RPC wait, and
+        # count the waits and the RPCs that arrived during one (an upper bound
+        # of the pickup delay the wait adds).
+        self._trace_no_spin = os.environ.get("VLLM_EARLY_RECV_NO_SPIN") == "1"
+        self._trace = os.environ.get("VLLM_EARLY_RECV_TRACE") == "1"
+        self._trace_wait_s = 0.0
+        self._trace_waits = 0
+        self._trace_polls = 0
+        self._trace_rpc_after_wait = 0
+        self._trace_rpc_after_wait_s = 0.0
+        self._trace_next_report = time.perf_counter() + 10.0
+
+    def _trace_report(self, now: float) -> None:
+        if not self._trace or now < self._trace_next_report:
+            return
+        logger.info(
+            "EARLY_RECV_TRACE spin_stats - %.6f pid=%d spin_s=%.3f iters=%d "
+            "polls=%d rpc_after_wait=%d rpc_after_wait_s=%.4f",
+            time.time(),
+            os.getpid(),
+            self._trace_wait_s,
+            self._trace_waits,
+            self._trace_polls,
+            self._trace_rpc_after_wait,
+            self._trace_rpc_after_wait_s,
+        )
+        self._trace_wait_s = 0.0
+        self._trace_waits = 0
+        self._trace_polls = 0
+        self._trace_rpc_after_wait = 0
+        self._trace_rpc_after_wait_s = 0.0
+        self._trace_next_report = now + 10.0
 
     def step_rpc_done(self) -> None:
         """Worker thread: an ``execute_model`` or ``sample_tokens`` RPC finished."""
@@ -83,6 +115,8 @@ class EarlyKVRecvSender:
 
     def wait_for_poll(self, rpc_mq: MessageQueue) -> bool:
         """Wait briefly for a pending receive, yielding to queued RPCs."""
+        if self._trace_no_spin:
+            return False
         if not has_kv_transfer_group() or rpc_mq.shutting_down or rpc_mq.readable():
             return False
         now = time.perf_counter()
@@ -93,11 +127,19 @@ class EarlyKVRecvSender:
             return False
         if (delay := self._next_poll - now) > 0:
             time.sleep(delay)
+            slept = time.perf_counter() - now
+            self._trace_wait_s += slept
+            self._trace_waits += 1
+            if rpc_mq.readable():
+                self._trace_rpc_after_wait += 1
+                self._trace_rpc_after_wait_s += slept
         # An RPC may have arrived during the bounded wait. Leave it for dequeue.
         return not rpc_mq.shutting_down and not rpc_mq.readable()
 
     def poll(self) -> None:
         """Send completed receives; let the worker monitor handle fatal errors."""
+        self._trace_polls += 1
+        self._trace_report(time.perf_counter())
         try:
             with torch.inference_mode():
                 req_ids = get_kv_transfer_group().poll_finished_recving()

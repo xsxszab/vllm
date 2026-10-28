@@ -3672,6 +3672,8 @@ class Scheduler(SchedulerInterface):
                 if self.recompute_kv_load_failures:
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(req_id)
+        if _EARLY_RECV_TRACE and affected_req_ids:
+            _trace("failed_seen", affected_req_ids)
         return set() if self.recompute_kv_load_failures else affected_req_ids
 
     def _handle_invalid_blocks(
