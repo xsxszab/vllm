@@ -14,6 +14,7 @@ import dataclasses
 import math
 import os
 import queue
+import re
 import socket
 import threading
 import time
@@ -92,6 +93,10 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from .metrics import MooncakeStoreConnectorStats
 
 logger = init_logger(__name__)
+
+# EXPERIMENT ONLY (not for upstream): missing-key failure injection.
+_TRACE_MISSING_SUFFIX = "-early-recv-missing"
+_TRACE_HIT_LABEL = re.compile(r"hit-(\d+)")
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
@@ -1103,6 +1108,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self.trace_completed: set[str] = set()
         self.trace_inject_fail_every = 0
         self.trace_injected: set[str] = set()
+        # Missing-key injection: "" (off), "report" or "silent" (negative
+        # control: the unwritten blocks are not reported).
+        self.trace_missing = ""
+        self.trace_pp_rank = 0
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1159,6 +1168,37 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._invalid_block_ids.clear()
         return invalid_block_ids
 
+    def _trace_inject_missing(
+        self, req_id: str, keys: list[str], starts: list[int]
+    ) -> list[str]:
+        """EXPERIMENT ONLY (not for upstream): on the first load of every
+        even-numbered hit request, rename the keys of every chunk whose index is
+        1 mod 4, so the store really returns not-found for them and leaves their
+        blocks unwritten."""
+        if not self.trace_missing or req_id in self.trace_injected:
+            return keys
+        m = _TRACE_HIT_LABEL.search(req_id)
+        if m is None or int(m.group(1)) % 2:
+            return keys
+        self.trace_injected.add(req_id)
+        uniq = sorted(set(starts))
+        chunk_tokens = min((b - a for a, b in zip(uniq, uniq[1:])), default=0)
+        if chunk_tokens <= 0:
+            return keys
+        hit = {i for i, s in enumerate(starts) if (s // chunk_tokens) % 4 == 1}
+        logger.info(
+            "EARLY_RECV_TRACE inject_missing %s %.6f pp_rank=%d mode=%s "
+            "chunk_tokens=%d keys=%d starts=%s",
+            req_id,
+            time.time(),
+            self.trace_pp_rank,
+            self.trace_missing,
+            chunk_tokens,
+            len(hit),
+            ",".join(str(s) for s in sorted({starts[i] for i in hit})),
+        )
+        return [k + _TRACE_MISSING_SUFFIX if i in hit else k for i, k in enumerate(keys)]
+
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
@@ -1182,6 +1222,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         size_list: list[list[int]] = []
         key_list: list[str] = []
         block_id_list: list[int] = []
+        key_starts: list[int] = []  # EXPERIMENT ONLY: chunk start tokens
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
                 continue
@@ -1204,6 +1245,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 for store_shard_id in db.store_layout.local_shard_ids:
                     key_list.append(db.store_layout.key_for(store_shard_id, block_hash))
                     chunks.append((start, end))
+                    key_starts.append(start)
                     store_shard_ids.append(store_shard_id)
             g_addrs, g_sizes, g_block_ids = db.store_layout.prepare_values(
                 chunks,
@@ -1220,6 +1262,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list_c = _rotate_list(addr_list, rotation)
         size_list_c = _rotate_list(size_list, rotation)
         block_id_list_c = _rotate_list(block_id_list, rotation)
+        key_list_c = self._trace_inject_missing(
+            req_id, key_list_c, _rotate_list(key_starts, rotation)
+        )
 
         load_batches = [
             (
@@ -1310,6 +1355,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         batch_keys, res, batch_block_ids, strict=True
                     )
                     if value < 0
+                    and not (
+                        self.trace_missing == "silent"
+                        and key.endswith(_TRACE_MISSING_SUFFIX)
+                    )
                 ]
                 self._record_operation(
                     "load_get",
@@ -1997,6 +2046,20 @@ class MooncakeStoreWorker:
                 recv_thread.trace_inject_fail_every = int(
                     os.environ.get("VLLM_EARLY_RECV_INJECT_FAIL_EVERY", "0")
                 )
+            # Missing-key injection on the PP ranks in
+            # VLLM_EARLY_RECV_INJECT_RANKS ("last", "all" or "0,2").
+            ranks = os.environ.get("VLLM_EARLY_RECV_INJECT_RANKS", "last")
+            if ranks == "last":
+                selected = self.pp_rank == self.pp_size - 1
+            elif ranks == "all":
+                selected = True
+            else:
+                selected = str(self.pp_rank) in ranks.split(",")
+            if selected:
+                recv_thread.trace_missing = os.environ.get(
+                    "VLLM_EARLY_RECV_INJECT_MISSING", ""
+                )
+            recv_thread.trace_pp_rank = self.pp_rank
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
