@@ -89,6 +89,33 @@ class SchedulerConfig:
     queued and running requests. Only applies when
     long_prefill_token_threshold is nonzero."""
 
+    pp_dynamic_chunking: bool = False
+    """Size prefill chunks by a per-chunk time target instead of the token
+    budget, for pipeline parallelism with async scheduling. Each chunk's
+    duration is predicted by a cost model fitted from dummy runs at startup,
+    and every chunk of a prompt is sized to take the same time, which
+    minimizes the prompt's TTFT across the pipeline stages. Requires
+    `pipeline_parallel_size > 1`, chunked prefill, the FCFS policy and the V2
+    model runner; incompatible with `long_prefill_token_threshold`. Off by
+    default."""
+
+    pp_dynamic_chunk_min_tokens: int = Field(default=512, ge=1)
+    """Smallest prefill chunk `pp_dynamic_chunking` schedules. Keeps GEMMs
+    out of the memory-bandwidth-bound regime; MoE models may want 1024-2048."""
+
+    pp_dynamic_chunk_cost: str | None = None
+    """Optional JSON object `{"o": ms, "a": ms/token, "b": ms/(q,k) pair}`
+    giving the `pp_dynamic_chunking` cost model directly, which skips the
+    startup profiling."""
+
+    pp_dynamic_chunk_profile_reps: int = Field(default=3, ge=1)
+    """Timed repetitions per sampling point (plus one warmup) when
+    `pp_dynamic_chunking` profiles the cost model at startup."""
+
+    pp_dynamic_chunk_max_fit_error: float = Field(default=0.10, gt=0.0)
+    """`pp_dynamic_chunking` is disabled when the cost model's mean absolute
+    percentage error over the profiling samples exceeds this fraction."""
+
     max_num_queued_reqs: int | None = Field(default=None, ge=0)
     """Maximum number of requests that can be in-flight (waiting or running)
     at the same time, or None for no limit. When the limit is reached, new
@@ -313,6 +340,24 @@ class SchedulerConfig:
             )
 
         self.verify_max_model_len(max_model_len)
+        self.verify_pp_dynamic_chunking()
+
+    def verify_pp_dynamic_chunking(self) -> None:
+        if not self.pp_dynamic_chunking:
+            return
+        if self.long_prefill_token_threshold > 0:
+            raise ValueError(
+                "pp_dynamic_chunking cannot be combined with "
+                "long_prefill_token_threshold; both cap prefill chunks."
+            )
+        if self.policy != "fcfs":
+            raise ValueError("pp_dynamic_chunking requires the 'fcfs' policy.")
+        if not self.enable_chunked_prefill:
+            raise ValueError("pp_dynamic_chunking requires chunked prefill.")
+        if self.pp_dynamic_chunk_cost is not None:
+            from vllm.v1.core.sched.pp_chunk_planner import ChunkCostModel
+
+            ChunkCostModel.from_json(self.pp_dynamic_chunk_cost)
 
     def verify_max_model_len(self, max_model_len: int) -> Self:
         if (

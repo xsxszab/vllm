@@ -1732,6 +1732,19 @@ class VllmConfig:
             else:
                 self.parallel_config.disable_nccl_for_dp_synchronization = False
 
+        if self.scheduler_config.pp_dynamic_chunking:
+            if self.parallel_config.pipeline_parallel_size <= 1:
+                logger.warning(
+                    "pp_dynamic_chunking requires pipeline_parallel_size > 1; "
+                    "disabling it."
+                )
+                self.scheduler_config.pp_dynamic_chunking = False
+            elif not self.use_v2_model_runner:
+                logger.warning(
+                    "pp_dynamic_chunking requires Model Runner V2; disabling it."
+                )
+                self.scheduler_config.pp_dynamic_chunking = False
+
         if (
             self.observability_config.per_request_spec_decode_metrics != "none"
             and self.speculative_config is None

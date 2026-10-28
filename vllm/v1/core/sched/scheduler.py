@@ -49,6 +49,7 @@ from vllm.v1.core.sched.output import (
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.pp_chunk_planner import PPChunkPlanner, PPChunkStep
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -144,6 +145,8 @@ class Scheduler(SchedulerInterface):
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
         )
+        # Set by EngineCore once the chunk cost model is known.
+        self.pp_chunk_planner: PPChunkPlanner | None = None
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -685,6 +688,10 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def set_pp_chunk_planner(self, planner: PPChunkPlanner | None) -> None:
+        """Enable (or disable with None) equal-time prefill chunking."""
+        self.pp_chunk_planner = planner
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -728,6 +735,12 @@ class Scheduler(SchedulerInterface):
         prefill_admitted = False
         # Whether any scheduled request has a synchronous connector KV load.
         has_sync_kv_loads = False
+        # Equal-time prefill chunking (pp_dynamic_chunking).
+        pp_step = (
+            PPChunkStep(self.pp_chunk_planner)
+            if self.pp_chunk_planner is not None
+            else None
+        )
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -835,6 +848,14 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            if pp_step is not None:
+                num_new_tokens = pp_step.cap(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
+                if num_new_tokens == 0:
+                    # Not enough of the step's time target left for a chunk.
+                    req_index += 1
+                    continue
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -990,6 +1011,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if pp_step is not None:
+                pp_step.commit(request, request.num_computed_tokens, num_new_tokens)
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1335,6 +1358,15 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
 
+                    if pp_step is not None:
+                        num_new_tokens = pp_step.cap(
+                            request, num_computed_tokens, num_new_tokens
+                        )
+                        if num_new_tokens == 0:
+                            # The step's time target is used up; the request
+                            # stays at the head of the queue (FCFS).
+                            break
+
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
                         num_new_tokens = self._mamba_block_aligned_split(
@@ -1543,6 +1575,8 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if pp_step is not None:
+                    pp_step.commit(request, num_computed_tokens, num_new_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1794,6 +1828,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.pp_chunk_target_ms = None
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are

@@ -619,6 +619,13 @@ class EngineArgs:
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
+    pp_dynamic_chunking: bool = SchedulerConfig.pp_dynamic_chunking
+    pp_dynamic_chunk_min_tokens: int = SchedulerConfig.pp_dynamic_chunk_min_tokens
+    pp_dynamic_chunk_cost: str | None = SchedulerConfig.pp_dynamic_chunk_cost
+    pp_dynamic_chunk_profile_reps: int = SchedulerConfig.pp_dynamic_chunk_profile_reps
+    pp_dynamic_chunk_max_fit_error: float = (
+        SchedulerConfig.pp_dynamic_chunk_max_fit_error
+    )
     max_num_seqs: int | None = None
     max_num_active_seqs: int | None = SchedulerConfig.max_num_active_seqs
     max_num_queued_reqs: int | None = None
@@ -1781,6 +1788,24 @@ class EngineArgs:
             "--long-prefill-token-threshold-adaptive",
             **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
         )
+        scheduler_group.add_argument(
+            "--pp-dynamic-chunking", **scheduler_kwargs["pp_dynamic_chunking"]
+        )
+        scheduler_group.add_argument(
+            "--pp-dynamic-chunk-min-tokens",
+            **scheduler_kwargs["pp_dynamic_chunk_min_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--pp-dynamic-chunk-cost", **scheduler_kwargs["pp_dynamic_chunk_cost"]
+        )
+        scheduler_group.add_argument(
+            "--pp-dynamic-chunk-profile-reps",
+            **scheduler_kwargs["pp_dynamic_chunk_profile_reps"],
+        )
+        scheduler_group.add_argument(
+            "--pp-dynamic-chunk-max-fit-error",
+            **scheduler_kwargs["pp_dynamic_chunk_max_fit_error"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -2680,6 +2705,11 @@ class EngineArgs:
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),
+            pp_dynamic_chunking=self.pp_dynamic_chunking,
+            pp_dynamic_chunk_min_tokens=self.pp_dynamic_chunk_min_tokens,
+            pp_dynamic_chunk_cost=self.pp_dynamic_chunk_cost,
+            pp_dynamic_chunk_profile_reps=self.pp_dynamic_chunk_profile_reps,
+            pp_dynamic_chunk_max_fit_error=self.pp_dynamic_chunk_max_fit_error,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,

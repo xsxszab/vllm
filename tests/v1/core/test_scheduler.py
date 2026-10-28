@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -55,6 +56,7 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 )
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.pp_chunk_planner import ChunkCostModel, PPChunkPlanner
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
@@ -8813,3 +8815,275 @@ def test_cpu_encoder_input_updates_preserve_shm_handles(use_v2_model_runner):
         {request.request_id: {1: None}} if use_v2_model_runner else {}
     )
     assert request.mm_features[0].data is handle
+
+
+# ---------------------------------------------------------------------------
+# pp_dynamic_chunking: equal-time prefill chunks for PP + async scheduling.
+# ---------------------------------------------------------------------------
+
+PP_CHUNK_COST = '{"o": 2, "a": 0.03, "b": 1.3e-6}'
+PP_CHUNK_C_MIN = 512
+
+
+def _pp_chunk_scheduler(monkeypatch, **kwargs):
+    """PP=4 async scheduler with a planner built from PP_CHUNK_COST, bypassing
+    the EngineCore startup profiling."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    scheduler = create_scheduler(
+        pipeline_parallel_size=4,
+        async_scheduling=True,
+        max_num_batched_tokens=32768,
+        max_model_len=256 * 1024,
+        num_blocks=20000,
+        pp_dynamic_chunking=True,
+        pp_dynamic_chunk_cost=PP_CHUNK_COST,
+        **kwargs,
+    )
+    planner = PPChunkPlanner(
+        ChunkCostModel.from_json(PP_CHUNK_COST),
+        pp_size=4,
+        gran=64,
+        c_min=PP_CHUNK_C_MIN,
+        c_max=32768,
+    )
+    scheduler.set_pp_chunk_planner(planner)
+    return scheduler, planner
+
+
+def _prefill_chunk_output(scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+    req_ids = list(scheduler_output.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        sampled_token_ids=[[] for _ in req_ids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def _drive_pp_prefill(scheduler, stop) -> list[dict[str, int]]:
+    """Run schedule() with up to max_concurrent_batches steps in flight, as a
+    PP pipeline does, returning each step's num_scheduled_tokens until
+    `stop(steps)` holds. Only non-final prefill chunks are ever completed."""
+    max_in_flight = scheduler.vllm_config.max_concurrent_batches
+    in_flight: deque[SchedulerOutput] = deque()
+    steps: list[dict[str, int]] = []
+    while True:
+        if len(in_flight) == max_in_flight:
+            done = in_flight.popleft()
+            scheduler.update_from_output(done, _prefill_chunk_output(done))
+        output = scheduler.schedule()
+        in_flight.append(output)
+        steps.append(dict(output.num_scheduled_tokens))
+        if stop(steps):
+            return steps
+
+
+def _scheduled_so_far(steps, req_id) -> int:
+    return sum(step.get(req_id, 0) for step in steps)
+
+
+def test_pp_dynamic_chunking_single_long_prefill(monkeypatch):
+    """A lone 128K prompt is chunked exactly as the planner predicts for its
+    T, with chunks shrinking as the prefix grows, even though earlier chunks
+    are still in flight across the pipeline."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
+    N = 128 * 1024
+    (req,) = create_requests(num_requests=1, num_tokens=N, max_tokens=1)
+    scheduler.add_request(req)
+
+    steps = _drive_pp_prefill(
+        scheduler, lambda steps: _scheduled_so_far(steps, req.request_id) == N
+    )
+    chunks = [step[req.request_id] for step in steps]
+    assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
+    assert chunks == planner.plan(N, 0)
+    assert all(a >= b for a, b in zip(chunks, chunks[1:]))
+    # Reference values from the design doc for these coefficients.
+    assert chunks[0] == 3072
+    assert min(chunks[:-1]) == PP_CHUNK_C_MIN
+    assert len(chunks) == 157
+
+
+def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
+    """A prefix cache hit shortens the remaining work, so T is computed from
+    the hit length, not from zero."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch, enable_prefix_caching=True)
+    (req_a,) = create_requests(
+        num_requests=1, num_tokens=32 * 1024, max_tokens=1, req_ids=["a"]
+    )
+    scheduler.add_request(req_a)
+    while not req_a.is_finished():
+        output = scheduler.schedule()
+        sampled = req_a.num_computed_tokens >= req_a.num_prompt_tokens
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=["a"],
+                req_id_to_index={"a": 0},
+                sampled_token_ids=[[0]] if sampled else [[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    # Same prompt tokens as "a" for the first 32K.
+    (req_b,) = create_requests(
+        num_requests=1, num_tokens=64 * 1024, max_tokens=1, req_ids=["b"]
+    )
+    scheduler.add_request(req_b)
+    output = scheduler.schedule()
+    hit = req_b.num_computed_tokens - output.num_scheduled_tokens["b"]
+    assert hit == 32 * 1024
+    expected_T = planner.target_time(req_b.num_prompt_tokens, hit)
+    assert req_b.pp_chunk_target_ms == pytest.approx(expected_T)
+    assert expected_T != pytest.approx(planner.target_time(req_b.num_prompt_tokens, 0))
+    assert (
+        output.num_scheduled_tokens["b"]
+        == planner.plan(req_b.num_prompt_tokens, hit)[0]
+    )
+
+
+def _tail_budget_ms(planner, N: int) -> float:
+    """Step time left after a lone N-token prompt's last chunk."""
+    T = planner.target_time(N, 0)
+    chunks = planner.plan(N, 0, T)
+    return T - planner.cost.o - planner.cost.work(chunks[-1], N - chunks[-1])
+
+
+def _pick_prompt_len(planner, fits_c_min: bool) -> int:
+    w_min = planner.cost.work(PP_CHUNK_C_MIN, 0)
+    for N in range(128 * 1024, 128 * 1024 + 64 * 64, 64):
+        if (_tail_budget_ms(planner, N) >= w_min) == fits_c_min:
+            return N
+    raise AssertionError("no prompt length with the requested tail budget")
+
+
+def test_pp_dynamic_chunking_fills_last_chunk_with_next_request(monkeypatch):
+    """When A's last chunk leaves at least a c_min chunk of time, B's first
+    chunk rides in the same step, within A's target, and FCFS order holds."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
+    N_a = _pick_prompt_len(planner, fits_c_min=True)
+    N_b = 16 * 1024
+    (req_a,) = create_requests(
+        num_requests=1, num_tokens=N_a, max_tokens=1, req_ids=["a"]
+    )
+    (req_b,) = create_requests(
+        num_requests=1, num_tokens=N_b, max_tokens=1, req_ids=["b"]
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    steps = _drive_pp_prefill(scheduler, lambda steps: "b" in steps[-1])
+    last = steps[-1]
+    assert _scheduled_so_far(steps, "a") == N_a
+    assert list(last) == ["a", "b"]
+    assert all("b" not in step for step in steps[:-1])
+
+    T_a = req_a.pp_chunk_target_ms
+    L_a = N_a - last["a"]
+    budget = T_a - planner.cost.o - planner.cost.work(last["a"], L_a)
+    assert last["b"] == planner.max_chunk(budget, 0, N_b)
+    assert last["b"] >= PP_CHUNK_C_MIN
+    assert planner.cost.work(last["a"], L_a) + planner.cost.work(last["b"], 0) <= (
+        T_a - planner.cost.o + 1e-9
+    )
+
+
+def test_pp_dynamic_chunking_defers_request_below_c_min(monkeypatch):
+    """When A's last chunk leaves less than a c_min chunk of time, B waits for
+    the next step and then starts at its own target."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
+    N_a = _pick_prompt_len(planner, fits_c_min=False)
+    N_b = 16 * 1024
+    (req_a,) = create_requests(
+        num_requests=1, num_tokens=N_a, max_tokens=1, req_ids=["a"]
+    )
+    (req_b,) = create_requests(
+        num_requests=1, num_tokens=N_b, max_tokens=1, req_ids=["b"]
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    steps = _drive_pp_prefill(scheduler, lambda steps: "b" in steps[-1])
+    assert _scheduled_so_far(steps[:-1], "a") == N_a
+    assert steps[-2] == {"a": steps[-2]["a"]}
+    assert steps[-1] == {"b": planner.plan(N_b, 0)[0]}
+    assert req_b.pp_chunk_target_ms == pytest.approx(planner.target_time(N_b, 0))
+
+
+def test_pp_dynamic_chunking_disabled_keeps_budget_chunks(monkeypatch):
+    """With the feature off the scheduler fills the token budget as before."""
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    N = 128 * 1024
+    expected = [32768] * 4
+    for pp_dynamic_chunking in (False, None):
+        kwargs = {}
+        if pp_dynamic_chunking is not None:
+            kwargs["pp_dynamic_chunking"] = pp_dynamic_chunking
+        scheduler = create_scheduler(
+            pipeline_parallel_size=4,
+            async_scheduling=True,
+            max_num_batched_tokens=32768,
+            max_model_len=256 * 1024,
+            num_blocks=20000,
+            **kwargs,
+        )
+        assert scheduler.pp_chunk_planner is None
+        (req,) = create_requests(num_requests=1, num_tokens=N, max_tokens=1)
+        scheduler.add_request(req)
+        steps = _drive_pp_prefill(
+            scheduler,
+            lambda steps, rid=req.request_id: _scheduled_so_far(steps, rid) == N,
+        )
+        assert [step[req.request_id] for step in steps] == expected
+        assert req.pp_chunk_target_ms is None
+
+
+def test_pp_dynamic_chunking_config_validation(monkeypatch):
+    with pytest.raises(ValueError, match="long_prefill_token_threshold"):
+        SchedulerConfig.default_factory(
+            pp_dynamic_chunking=True, long_prefill_token_threshold=1024
+        )
+    with pytest.raises(ValueError, match="fcfs"):
+        SchedulerConfig.default_factory(pp_dynamic_chunking=True, policy="priority")
+    with pytest.raises(ValueError, match="chunked prefill"):
+        SchedulerConfig.default_factory(
+            pp_dynamic_chunking=True, enable_chunked_prefill=False, max_model_len=2048
+        )
+    with pytest.raises(ValueError, match="pp_dynamic_chunk_cost"):
+        SchedulerConfig.default_factory(
+            pp_dynamic_chunking=True, pp_dynamic_chunk_cost='{"o": 1}'
+        )
+    # Disabled with PP=1 and with the V1 model runner.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    scheduler = create_scheduler(pipeline_parallel_size=1, pp_dynamic_chunking=True)
+    assert not scheduler.scheduler_config.pp_dynamic_chunking
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    scheduler = create_scheduler(pipeline_parallel_size=2, pp_dynamic_chunking=True)
+    assert not scheduler.scheduler_config.pp_dynamic_chunking
+
+
+def test_pp_dynamic_chunking_preemption_resets_target(monkeypatch):
+    """Preemption discards the prefix, so T is recomputed on resumption."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
+    N = 128 * 1024
+    (req,) = create_requests(num_requests=1, num_tokens=N, max_tokens=1)
+    scheduler.add_request(req)
+    output = scheduler.schedule()
+    assert req.pp_chunk_target_ms is not None
+
+    scheduler.running.remove(req)
+    scheduler._preempt_request(req, 0.0)
+    assert req.status == RequestStatus.PREEMPTED
+    assert req.pp_chunk_target_ms is None
+
+    scheduler.update_from_output(output, _prefill_chunk_output(output))
+    output = scheduler.schedule()
+    assert req.status == RequestStatus.RUNNING
+    assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
+    assert output.num_scheduled_tokens[req.request_id] == planner.plan(N, 0)[0]
