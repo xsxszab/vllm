@@ -3,6 +3,7 @@
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
 import os
+import re
 import time
 from typing import TYPE_CHECKING
 
@@ -34,6 +35,9 @@ logger = init_logger(__name__)
 # readback, absorbing clock-offset error and read latency.
 _KV_BLOCKS_EXPIRY_SAFETY_MARGIN = 5.0
 
+# EXPERIMENT ONLY (not for upstream): request label of the fact-check load.
+_TRACE_HIT_LABEL = re.compile(r"hit-(\d+)")
+
 
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     """Pull-specific (READ) worker logic."""
@@ -59,6 +63,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._early_finished_recving = set()
         # Registration generation of each remote engine's loaded agent.
         self._remote_registration_generations: dict[EngineId, int] = {}
+        # EXPERIMENT ONLY (not for upstream): skip the pull of every even hit
+        # request on the selected TP ranks, so its blocks keep stale data.
+        # "report" fails it like a NIXL transfer error; "silent" reports it
+        # as received (negative control).
+        self._trace_inject = os.environ.get("VLLM_EARLY_RECV_INJECT_NIXL", "")
+        ranks = os.environ.get("VLLM_EARLY_RECV_INJECT_RANKS", "all")
+        if ranks != "all" and str(self.tp_rank) not in ranks.split(","):
+            self._trace_inject = ""
+        self._trace_injected: set[str] = set()
 
     def _pop_done_transfers(
         self, transfers: dict[str, list[int]]
@@ -67,6 +80,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # pull finish. NIXL completion is only seen when polled, so this is an
         # observation time, not the transfer's true end.
         done, failed = super()._pop_done_transfers(transfers)
+        if self._trace_inject == "report":
+            for req_id in done & self._trace_injected:
+                self._handle_failed_transfer(req_id, None, failed)
         if done and os.environ.get("VLLM_EARLY_RECV_TRACE") == "1":
             now = time.time()
             for req_id in done:
@@ -110,6 +126,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         done -= failed
         if done:
             self._finish_recved(done, set())
+        if os.environ.get("VLLM_EARLY_RECV_TRACE") == "1":
+            now = time.time()
+            for req_id in finished | done:
+                logger.info(
+                    "EARLY_RECV_TRACE early_sent %s %.6f pp_rank=%d",
+                    req_id,
+                    now,
+                    self.tp_rank,
+                )
         return finished | done
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
@@ -190,6 +215,23 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)
 
+    def _trace_inject_now(self, req_id: str) -> bool:
+        """EXPERIMENT ONLY (not for upstream): skip this pull?"""
+        m = _TRACE_HIT_LABEL.search(req_id)
+        if m is None or int(m.group(1)) % 2 or req_id in self._trace_injected:
+            return False
+        self._trace_injected.add(req_id)
+        # Rank field named pp_rank for fact_analyze.py; it is the TP rank here.
+        logger.info(
+            "EARLY_RECV_TRACE inject_missing %s %.6f pp_rank=%d mode=%s "
+            "chunk_tokens=1000000000 keys=0 starts=0",
+            req_id,
+            time.time(),
+            self.tp_rank,
+            self._trace_inject,
+        )
+        return True
+
     def _is_turn2_read_expired(self, meta: ReqMeta) -> bool:
         """Whether D's cached blocks for this turn-2 readback have (nearly) expired."""
         assert meta.remote is not None
@@ -244,6 +286,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # then takes the notify-only path without registering a transfer.
             # Seed the entry so this rank still reports completion.
             self._recving_transfers.setdefault(req_id, [])
+            if self._trace_inject and self._trace_inject_now(req_id):
+                return
 
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
