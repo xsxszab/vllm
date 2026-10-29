@@ -152,7 +152,9 @@ class Scheduler(SchedulerInterface):
         )
         self.pp_chunk_planner: PPChunkPlanner | None = None
         if self.scheduler_config.pp_dynamic_chunking:
-            assert self.scheduler_config.pp_dynamic_chunk_cost is not None
+            # EngineCore profiles the cost model at startup if it is not given.
+            if self.scheduler_config.pp_dynamic_chunk_cost is None:
+                raise ValueError("pp_dynamic_chunking requires pp_dynamic_chunk_cost.")
             self.pp_chunk_planner = PPChunkPlanner(
                 ChunkCostModel.from_json(self.scheduler_config.pp_dynamic_chunk_cost),
                 pp_size=self.parallel_config.pipeline_parallel_size,

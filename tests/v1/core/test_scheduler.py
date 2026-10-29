@@ -56,7 +56,7 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 )
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.pp_chunk_planner import ChunkCostModel
+from vllm.v1.core.sched.pp_chunk_planner import PP_CHUNK_ALIGNMENT, ChunkCostModel
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
@@ -8900,10 +8900,9 @@ def test_pp_dynamic_chunking_single_long_prefill(monkeypatch):
     assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
     assert chunks == planner.plan(N, 0)
     assert all(a >= b for a, b in zip(chunks, chunks[1:]))
-    # Reference values from the design doc for these coefficients.
     assert chunks[0] == 3072
     assert min(chunks[:-1]) == PP_CHUNK_C_MIN
-    assert len(chunks) == 157
+    assert all(c % PP_CHUNK_ALIGNMENT == 0 for c in chunks[:-1])
 
 
 def _cache_prompt(scheduler, num_tokens: int) -> None:
@@ -9163,8 +9162,14 @@ def test_pp_dynamic_chunking_config_validation(monkeypatch):
         SchedulerConfig.default_factory(
             pp_dynamic_chunking=True, enable_chunked_prefill=False, max_model_len=2048
         )
+    # Without a cost model, EngineCore profiles one before building the
+    # scheduler; a scheduler built without it cannot plan.
+    SchedulerConfig.default_factory(pp_dynamic_chunking=True)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     with pytest.raises(ValueError, match="requires pp_dynamic_chunk_cost"):
-        SchedulerConfig.default_factory(pp_dynamic_chunking=True)
+        create_scheduler(
+            pipeline_parallel_size=4, async_scheduling=True, pp_dynamic_chunking=True
+        )
     with pytest.raises(ValueError, match="pp_dynamic_chunk_cost"):
         SchedulerConfig.default_factory(
             pp_dynamic_chunking=True, pp_dynamic_chunk_cost='{"o": 1}'

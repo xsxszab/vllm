@@ -110,6 +110,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
+from vllm.v1.worker.gpu.pp_chunk_profile import profile_pp_chunk_cost
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -168,6 +169,7 @@ class EngineCore:
 
         # Setup KV Caches and update CacheConfig after profiling.
         kv_cache_config = self._initialize_kv_caches(vllm_config)
+        profile_pp_chunk_cost(vllm_config, self.collective_rpc)
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.

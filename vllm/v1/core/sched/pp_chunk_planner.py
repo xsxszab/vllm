@@ -32,10 +32,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Chunk sizes are rounded down to a multiple of this; measured neutral on
-# FlashInfer/TRTLLM attention, but keeps chunks page-aligned for common
-# block sizes.
-PP_CHUNK_ALIGNMENT = 64
+# Chunk sizes are rounded down to a multiple of this. Prefill kernels (e.g.
+# TRTLLM attention on B300) run 10-30% slower on chunks that are not a
+# multiple of 256, so finer alignment loses more than it gains.
+PP_CHUNK_ALIGNMENT = 512
 # Bounds the per-step cost of PPChunkPlanner.queue_target_time.
 _MAX_QUEUE_SCAN = 64
 

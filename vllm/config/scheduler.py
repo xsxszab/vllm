@@ -96,9 +96,9 @@ class SchedulerConfig:
     chunk of a prompt is sized to take the same time, which minimizes the
     prompt's TTFT across the pipeline stages; with a backlog of prefills the
     target grows to minimize their mean TTFT. Requires
-    `pipeline_parallel_size > 1`, chunked prefill, the FCFS policy, the V2
-    model runner and `pp_dynamic_chunk_cost`; incompatible with
-    `long_prefill_token_threshold`. Off by default."""
+    `pipeline_parallel_size > 1`, chunked prefill, the FCFS policy and the V2
+    model runner; incompatible with `long_prefill_token_threshold`. Off by
+    default."""
 
     pp_dynamic_chunk_min_tokens: int = Field(default=512, ge=1)
     """Smallest prefill chunk `pp_dynamic_chunking` schedules. Keeps GEMMs
@@ -108,7 +108,8 @@ class SchedulerConfig:
     """JSON object `{"o": ms, "a": ms/token, "b": ms/(q,k) pair}` giving the
     `pp_dynamic_chunking` cost model of one prefill chunk on the slowest
     pipeline stage: `o + a * c + b * c * (L + c / 2)` for a chunk of `c`
-    tokens after a prefix of `L`."""
+    tokens after a prefix of `L`. If unset, every stage is profiled at startup
+    and the fitted model is logged, so it can be passed here to skip that."""
 
     max_num_queued_reqs: int | None = Field(default=None, ge=0)
     """Maximum number of requests that can be in-flight (waiting or running)
@@ -348,11 +349,10 @@ class SchedulerConfig:
             raise ValueError("pp_dynamic_chunking requires the 'fcfs' policy.")
         if not self.enable_chunked_prefill:
             raise ValueError("pp_dynamic_chunking requires chunked prefill.")
-        if self.pp_dynamic_chunk_cost is None:
-            raise ValueError("pp_dynamic_chunking requires pp_dynamic_chunk_cost.")
-        from vllm.v1.core.sched.pp_chunk_planner import ChunkCostModel
+        if self.pp_dynamic_chunk_cost is not None:
+            from vllm.v1.core.sched.pp_chunk_planner import ChunkCostModel
 
-        ChunkCostModel.from_json(self.pp_dynamic_chunk_cost)
+            ChunkCostModel.from_json(self.pp_dynamic_chunk_cost)
 
     def verify_max_model_len(self, max_model_len: int) -> Self:
         if (

@@ -174,3 +174,30 @@ async def test_pp_dp_v2_pause_resume():
 
         n = await _generate(engine, PROMPT, max_tokens=8)
         assert n == 8
+
+
+def test_pp_dynamic_chunking_profiles_cost_at_startup(monkeypatch):
+    """Without --pp-dynamic-chunk-cost, EngineCore profiles every pipeline
+    stage at startup and the scheduler plans with the fitted cost model."""
+    from vllm import LLM
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    llm = LLM(
+        model=PP_DP_MODEL,
+        pipeline_parallel_size=2,
+        max_model_len=4096,
+        max_num_batched_tokens=2048,
+        async_scheduling=True,
+        enable_prefix_caching=False,
+        pp_dynamic_chunking=True,
+    )
+    # In-process engine core (VLLM_ENABLE_V1_MULTIPROCESSING=0).
+    engine_core = llm.llm_engine.engine_core.engine_core  # type: ignore[attr-defined]
+    planner = engine_core.scheduler.pp_chunk_planner
+    assert planner is not None
+    assert planner.cost.o > 0
+    assert planner.cost.a + planner.cost.b > 0
+    (output,) = llm.generate(
+        [PROMPT * 250], SamplingParams(max_tokens=4, ignore_eos=True, temperature=0.0)
+    )
+    assert len(output.outputs[0].token_ids) == 4
