@@ -431,3 +431,18 @@ def get_kv_cache_configs(
         available_memory,
         kv_cache_planning.get_global_kv_cache_groups(vllm_config, kv_cache_specs),
     )
+
+
+def pp_chunk_plan(planner, N: int, L0: int, T: float | None = None) -> list[int]:
+    """Chunk sizes pp_dynamic_chunking gives a lone N-token request starting
+    from prefix L0, in scheduling order."""
+    if T is None:
+        T = planner.target_time(N, L0)
+    chunks: list[int] = []
+    L = L0
+    while L < N:
+        c = planner.max_chunk(T - planner.cost.o, L, N - L)
+        c = max(c, min(planner.c_min, N - L))
+        chunks.append(c)
+        L += c
+    return chunks

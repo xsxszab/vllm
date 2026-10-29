@@ -6,9 +6,6 @@ Every pipeline stage times its own forward pass on synthetic chunked prefills
 over a grid of chunk sizes and prefix lengths, without the inter-stage
 send/recv. The engine fits ``d(c, L) = o + a * c + b * c * (L + c / 2)`` to
 the slowest stage at each grid point and hands it to the scheduler.
-
-The measured ``o`` covers the per-step host work and GPU time of one stage,
-but not the pipeline's inter-stage transfers.
 """
 
 import json
@@ -21,6 +18,7 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.core.sched.pp_chunk_planner import ChunkCostModel
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -30,6 +28,9 @@ logger = init_logger(__name__)
 _PREFIX_FRACTIONS = (0.0, 0.25, 0.5, 1.0)
 _NUM_WARMUP = 1
 _NUM_TIMED = 3
+# An o near zero would drive the target time to zero and squeeze every chunk
+# down to c_min, so o is kept at least this fraction of the median sample.
+_O_FLOOR_FRAC = 0.01
 
 
 def _grid(c_min: int, c_max: int, max_prefix: int) -> list[tuple[int, int]]:
@@ -38,6 +39,49 @@ def _grid(c_min: int, c_max: int, max_prefix: int) -> list[tuple[int, int]]:
     )
     prefixes = sorted({int(f * max_prefix) // 64 * 64 for f in _PREFIX_FRACTIONS})
     return [(c, L) for L in prefixes for c in chunks]
+
+
+def _nonneg_lstsq(phi: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Least squares on relative error, dropping negative coefficients."""
+    w = 1.0 / t
+    coef = np.zeros(phi.shape[1])
+    free = np.ones(phi.shape[1], dtype=bool)
+    while free.any():
+        sol, *_ = np.linalg.lstsq(phi[:, free] * w[:, None], t * w, rcond=None)
+        coef[:] = 0.0
+        coef[free] = sol
+        if (sol >= 0).all():
+            break
+        free[free] = sol >= 0
+    return coef
+
+
+def fit_chunk_cost(
+    samples: list[tuple[int, int, float]],
+) -> tuple[ChunkCostModel, float]:
+    """Fit the cost model to ``(chunk_size, prefix_len, time_ms)`` samples.
+
+    Returns:
+        The model and its mean relative error over the samples.
+
+    Raises:
+        ValueError: fewer than two distinct chunk sizes or prefix lengths.
+
+    """
+    if len({c for c, _, _ in samples}) < 2 or len({L for _, L, _ in samples}) < 2:
+        raise ValueError(
+            "fitting the chunk cost model needs at least two distinct chunk "
+            "sizes and two distinct prefix lengths"
+        )
+    phi = np.array([[1.0, c, c * (L + c / 2)] for c, L, _ in samples])
+    t = np.array([t for _, _, t in samples], dtype=float)
+    coef = _nonneg_lstsq(phi, t)
+    o_floor = _O_FLOOR_FRAC * float(np.median(t))
+    if coef[0] < o_floor:
+        coef = np.concatenate(([o_floor], _nonneg_lstsq(phi[:, 1:], t - o_floor)))
+    fit_error = float(np.mean(np.abs(phi @ coef - t) / t))
+    o, a, b = (float(x) for x in coef)
+    return ChunkCostModel(o=o, a=a, b=b), fit_error
 
 
 @torch.inference_mode()
@@ -96,8 +140,6 @@ def profile_pp_chunk_cost(
     while no request holds KV blocks. On failure, dynamic chunking is
     disabled rather than failing startup.
     """
-    from vllm.v1.core.sched.pp_chunk_planner import fit_chunk_cost
-
     scheduler_config = vllm_config.scheduler_config
     if (
         not scheduler_config.pp_dynamic_chunking
@@ -118,7 +160,9 @@ def profile_pp_chunk_cost(
         reports = collective_rpc(_profile_on_worker, args=(grid,))
         # The slowest stage paces the pipeline.
         stage_ms = [max(times[i] for _, times in reports) for i in range(len(grid))]
-        cost, report = fit_chunk_cost([(c, L, t) for (c, L), t in zip(grid, stage_ms)])
+        cost, fit_error = fit_chunk_cost(
+            [(c, L, t) for (c, L), t in zip(grid, stage_ms)]
+        )
     except Exception:
         logger.exception(
             "pp_dynamic_chunking: profiling the chunk cost model failed; "
@@ -131,11 +175,10 @@ def profile_pp_chunk_cost(
     )
     logger.info(
         "pp_dynamic_chunking: profiled %d points on %d stages, cost model %s "
-        "(mean fit error %.1f%%%s). Pass it as --pp-dynamic-chunk-cost to skip "
+        "(mean fit error %.1f%%). Pass it as --pp-dynamic-chunk-cost to skip "
         "profiling.",
         len(grid),
         len({rank for rank, _ in reports}),
         scheduler_config.pp_dynamic_chunk_cost,
-        100 * report.fit_error,
-        ", o floored" if report.o_floored else "",
+        100 * fit_error,
     )

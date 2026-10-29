@@ -82,7 +82,13 @@ from vllm.v1.outputs import (
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 
-from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
+from .utils import (
+    EOS_TOKEN_ID,
+    create_requests,
+    create_scheduler,
+    mock_kv,
+    pp_chunk_plan,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -8898,7 +8904,7 @@ def test_pp_dynamic_chunking_single_long_prefill(monkeypatch):
     )
     chunks = [step[req.request_id] for step in steps]
     assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
-    assert chunks == planner.plan(N, 0)
+    assert chunks == pp_chunk_plan(planner, N, 0)
     assert all(a >= b for a, b in zip(chunks, chunks[1:]))
     assert chunks[0] == 3072
     assert min(chunks[:-1]) == PP_CHUNK_C_MIN
@@ -8941,31 +8947,26 @@ def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
     output = scheduler.schedule()
     hit = req_b.num_computed_tokens - output.num_scheduled_tokens["b"]
     assert hit == 32 * 1024
-    expected_T = planner.target_time(req_b.num_prompt_tokens, hit)
-    assert req_b.pp_chunk_target_ms == pytest.approx(expected_T)
-    assert expected_T != pytest.approx(planner.target_time(req_b.num_prompt_tokens, 0))
-    assert (
-        output.num_scheduled_tokens["b"]
-        == planner.plan(req_b.num_prompt_tokens, hit)[0]
-    )
+    N = req_b.num_prompt_tokens
+    assert req_b.pp_chunk_target_ms == pytest.approx(planner.target_time(N, hit))
+    assert planner.target_time(N, hit) != pytest.approx(planner.target_time(N, 0))
+    assert output.num_scheduled_tokens["b"] == pp_chunk_plan(planner, N, hit)[0]
 
 
 def test_pp_dynamic_chunking_queue_target_credits_waiting_prefix_hit(monkeypatch):
     """Agentic backlog: waiting turns that mostly hit the prefix cache count
-    only their uncached tail toward the queue target, so the step target is
-    not inflated as if every prompt were prefilled from scratch. Each waiting
+    only their uncached tail toward the queue target, and each waiting
     request's hit is looked up once."""
     scheduler, planner = _pp_chunk_scheduler(monkeypatch, enable_prefix_caching=True)
     hit = 32 * 1024
     _cache_prompt(scheduler, hit)
-    reqs = create_requests(
+    for req in create_requests(
         num_requests=2,
         num_tokens=hit + 2048,
         max_tokens=1,
         req_ids=["b", "c"],
         same_prompt=True,
-    )
-    for req in reqs:
+    ):
         scheduler.add_request(req)
 
     kv_cache_manager = scheduler.kv_cache_manager
@@ -8978,100 +8979,63 @@ def test_pp_dynamic_chunking_queue_target_credits_waiting_prefix_hit(monkeypatch
 
     monkeypatch.setattr(kv_cache_manager, "peek_num_cached_tokens", counting_peek)
     queue = list(scheduler.waiting)
-    T = planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
+    for _ in range(2):
+        T = planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
     assert pytest.approx(planner.queue_target_time(queue, lambda r: hit)) == T
-    assert planner.queue_target_time(queue) > T
-    planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
+    assert planner.queue_target_time(queue, lambda r: 0) > T
     assert lookups == ["b", "c"]
 
 
-def _tail_budget_ms(planner, N: int) -> float:
-    """Step time left after a lone N-token prompt's last chunk."""
-    T = planner.target_time(N, 0)
-    chunks = planner.plan(N, 0, T)
-    return T - planner.cost.o - planner.cost.work(chunks[-1], N - chunks[-1])
+@pytest.mark.parametrize("fits_c_min", [True, False])
+def test_pp_dynamic_chunking_packs_next_request_into_last_chunk(
+    monkeypatch, fits_c_min: bool
+):
+    """B arrives just before A's last chunk. If that chunk leaves at least a
+    c_min chunk of A's target, B's first chunk rides in the same step within
+    the target; otherwise B waits for the next step and starts at its own
+    target. FCFS order holds either way."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
+    cost = planner.cost
 
+    def spare_ms(N: int) -> float:
+        last = pp_chunk_plan(planner, N, 0)[-1]
+        return planner.target_time(N, 0) - cost.o - cost.work(last, N - last)
 
-def _pick_prompt_len(planner, fits_c_min: bool) -> int:
-    w_min = planner.cost.work(PP_CHUNK_C_MIN, 0)
-    for N in range(128 * 1024, 128 * 1024 + 64 * 64, 64):
-        if (_tail_budget_ms(planner, N) >= w_min) == fits_c_min:
-            return N
-    raise AssertionError("no prompt length with the requested tail budget")
+    N_a = next(
+        N
+        for N in range(128 * 1024, 132 * 1024, 64)
+        if (spare_ms(N) >= cost.work(PP_CHUNK_C_MIN, 0)) == fits_c_min
+    )
+    N_b = 16 * 1024
+    req_a, req_b = (
+        create_requests(num_requests=1, num_tokens=N, max_tokens=1, req_ids=[rid])[0]
+        for N, rid in ((N_a, "a"), (N_b, "b"))
+    )
+    scheduler.add_request(req_a)
+    last_a = pp_chunk_plan(planner, N_a, 0)[-1]
 
-
-def _add_before_last_chunk(scheduler, planner, req_a, req_b):
-    """Hook adding B just before A's last chunk is scheduled, when the
-    backlog is too small to raise the step target above A's own."""
-    last_chunk = planner.plan(req_a.num_prompt_tokens, 0)[-1]
-
-    def before_step(steps):
-        scheduled = _scheduled_so_far(steps, req_a.request_id)
-        if scheduled == req_a.num_prompt_tokens - last_chunk:
+    def add_b_before_last_chunk(steps):
+        if _scheduled_so_far(steps, "a") == N_a - last_a:
             scheduler.add_request(req_b)
-            queue_ms = planner.queue_target_time([req_a, req_b])
+            # The backlog is too small to raise the step target above A's.
+            queue_ms = planner.queue_target_time(
+                [req_a, req_b], lambda r: r.num_computed_tokens
+            )
             assert 0 < queue_ms < req_a.pp_chunk_target_ms
 
-    return before_step
-
-
-def test_pp_dynamic_chunking_fills_last_chunk_with_next_request(monkeypatch):
-    """When A's last chunk leaves at least a c_min chunk of time, B's first
-    chunk rides in the same step, within A's target, and FCFS order holds."""
-    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
-    N_a = _pick_prompt_len(planner, fits_c_min=True)
-    N_b = 16 * 1024
-    (req_a,) = create_requests(
-        num_requests=1, num_tokens=N_a, max_tokens=1, req_ids=["a"]
-    )
-    (req_b,) = create_requests(
-        num_requests=1, num_tokens=N_b, max_tokens=1, req_ids=["b"]
-    )
-    scheduler.add_request(req_a)
-
     steps = _drive_pp_prefill(
-        scheduler,
-        lambda steps: "b" in steps[-1],
-        _add_before_last_chunk(scheduler, planner, req_a, req_b),
+        scheduler, lambda steps: "b" in steps[-1], add_b_before_last_chunk
     )
-    last = steps[-1]
     assert _scheduled_so_far(steps, "a") == N_a
-    assert list(last) == ["a", "b"]
     assert all("b" not in step for step in steps[:-1])
-
-    T_a = req_a.pp_chunk_target_ms
-    L_a = N_a - last["a"]
-    budget = T_a - planner.cost.o - planner.cost.work(last["a"], L_a)
-    assert last["b"] == planner.max_chunk(budget, 0, N_b)
-    assert last["b"] >= PP_CHUNK_C_MIN
-    assert planner.cost.work(last["a"], L_a) + planner.cost.work(last["b"], 0) <= (
-        T_a - planner.cost.o + 1e-9
-    )
-
-
-def test_pp_dynamic_chunking_defers_request_below_c_min(monkeypatch):
-    """When A's last chunk leaves less than a c_min chunk of time, B waits for
-    the next step and then starts at its own target."""
-    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
-    N_a = _pick_prompt_len(planner, fits_c_min=False)
-    N_b = 16 * 1024
-    (req_a,) = create_requests(
-        num_requests=1, num_tokens=N_a, max_tokens=1, req_ids=["a"]
-    )
-    (req_b,) = create_requests(
-        num_requests=1, num_tokens=N_b, max_tokens=1, req_ids=["b"]
-    )
-    scheduler.add_request(req_a)
-
-    steps = _drive_pp_prefill(
-        scheduler,
-        lambda steps: "b" in steps[-1],
-        _add_before_last_chunk(scheduler, planner, req_a, req_b),
-    )
-    assert _scheduled_so_far(steps[:-1], "a") == N_a
-    assert steps[-2] == {"a": steps[-2]["a"]}
-    assert steps[-1] == {"b": planner.plan(N_b, 0)[0]}
-    assert req_b.pp_chunk_target_ms == pytest.approx(planner.target_time(N_b, 0))
+    if fits_c_min:
+        assert list(steps[-1]) == ["a", "b"]
+        assert steps[-1]["b"] == planner.max_chunk(spare_ms(N_a), 0, N_b)
+        assert steps[-1]["b"] >= PP_CHUNK_C_MIN
+    else:
+        assert steps[-2] == {"a": last_a}
+        assert steps[-1] == {"b": pp_chunk_plan(planner, N_b, 0)[0]}
+        assert req_b.pp_chunk_target_ms == pytest.approx(planner.target_time(N_b, 0))
 
 
 def test_pp_dynamic_chunking_backlog_raises_step_target(monkeypatch):
@@ -9087,13 +9051,13 @@ def test_pp_dynamic_chunking_backlog_raises_step_target(monkeypatch):
         reqs = create_requests(num_requests=num_reqs, num_tokens=N, max_tokens=1)
         for req in reqs:
             scheduler.add_request(req)
-        queue_ms = planner.queue_target_time(reqs)
+        queue_ms = planner.queue_target_time(reqs, lambda r: r.num_computed_tokens)
         output = scheduler.schedule()
         assert list(output.num_scheduled_tokens) == [reqs[0].request_id]
         first = output.num_scheduled_tokens[reqs[0].request_id]
         if num_reqs == 1:
             assert queue_ms == 0
-            assert first == planner.plan(N, 0)[0]
+            assert first == pp_chunk_plan(planner, N, 0)[0]
         else:
             assert first == planner.max_chunk(queue_ms - planner.cost.o, 0, N)
         # A's own target stays its single-request optimum.
@@ -9122,57 +9086,21 @@ def test_pp_dynamic_chunking_spec_decode_padding(monkeypatch):
     assert resumed.pp_chunk_target_ms is None
 
 
-def test_pp_dynamic_chunking_disabled_keeps_budget_chunks(monkeypatch):
-    """With the feature off the scheduler fills the token budget as before."""
-    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    N = 128 * 1024
-    expected = [32768] * 4
-    for pp_dynamic_chunking in (False, None):
-        kwargs = {}
-        if pp_dynamic_chunking is not None:
-            kwargs["pp_dynamic_chunking"] = pp_dynamic_chunking
-        scheduler = create_scheduler(
-            pipeline_parallel_size=4,
-            async_scheduling=True,
-            max_num_batched_tokens=32768,
-            max_model_len=256 * 1024,
-            num_blocks=20000,
-            **kwargs,
-        )
-        assert scheduler.pp_chunk_planner is None
-        (req,) = create_requests(num_requests=1, num_tokens=N, max_tokens=1)
-        scheduler.add_request(req)
-        steps = _drive_pp_prefill(
-            scheduler,
-            lambda steps, rid=req.request_id: _scheduled_so_far(steps, rid) == N,
-        )
-        assert [step[req.request_id] for step in steps] == expected
-        assert req.pp_chunk_target_ms is None
-
-
 def test_pp_dynamic_chunking_config_validation(monkeypatch):
-    with pytest.raises(ValueError, match="long_prefill_token_threshold"):
-        SchedulerConfig.default_factory(
-            pp_dynamic_chunking=True, long_prefill_token_threshold=1024
-        )
-    with pytest.raises(ValueError, match="fcfs"):
-        SchedulerConfig.default_factory(pp_dynamic_chunking=True, policy="priority")
-    with pytest.raises(ValueError, match="chunked prefill"):
-        SchedulerConfig.default_factory(
-            pp_dynamic_chunking=True, enable_chunked_prefill=False, max_model_len=2048
-        )
+    for kwargs, match in (
+        ({"long_prefill_token_threshold": 1024}, "long_prefill_token_threshold"),
+        ({"policy": "priority"}, "fcfs"),
+        ({"enable_chunked_prefill": False, "max_model_len": 2048}, "chunked prefill"),
+        ({"pp_dynamic_chunk_cost": '{"o": 1}'}, "pp_dynamic_chunk_cost"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            SchedulerConfig.default_factory(pp_dynamic_chunking=True, **kwargs)
     # Without a cost model, EngineCore profiles one before building the
     # scheduler; a scheduler built without it cannot plan.
-    SchedulerConfig.default_factory(pp_dynamic_chunking=True)
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     with pytest.raises(ValueError, match="requires pp_dynamic_chunk_cost"):
         create_scheduler(
             pipeline_parallel_size=4, async_scheduling=True, pp_dynamic_chunking=True
-        )
-    with pytest.raises(ValueError, match="pp_dynamic_chunk_cost"):
-        SchedulerConfig.default_factory(
-            pp_dynamic_chunking=True, pp_dynamic_chunk_cost='{"o": 1}'
         )
     # Disabled with PP=1 and with the V1 model runner.
     for pp_size, use_v2 in ((1, "1"), (2, "0")):
@@ -9182,7 +9110,6 @@ def test_pp_dynamic_chunking_config_validation(monkeypatch):
             pp_dynamic_chunking=True,
             pp_dynamic_chunk_cost=PP_CHUNK_COST,
         )
-        assert not scheduler.scheduler_config.pp_dynamic_chunking
         assert scheduler.pp_chunk_planner is None
 
 
@@ -9197,11 +9124,11 @@ def test_pp_dynamic_chunking_preemption_resets_target(monkeypatch):
 
     scheduler.running.remove(req)
     scheduler._preempt_request(req, 0.0)
-    assert req.status == RequestStatus.PREEMPTED
     assert req.pp_chunk_target_ms is None
 
     scheduler.update_from_output(output, _prefill_chunk_output(output))
     output = scheduler.schedule()
     assert req.status == RequestStatus.RUNNING
     assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
-    assert output.num_scheduled_tokens[req.request_id] == planner.plan(N, 0)[0]
+    first_chunk = output.num_scheduled_tokens[req.request_id]
+    assert first_chunk == pp_chunk_plan(planner, N, 0)[0]

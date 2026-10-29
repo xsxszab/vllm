@@ -69,6 +69,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.pp_chunk_profile import profile_pp_chunk_cost
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
@@ -110,7 +111,6 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
-from vllm.v1.worker.gpu.pp_chunk_profile import profile_pp_chunk_cost
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)

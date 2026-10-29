@@ -16,21 +16,13 @@ per-chunk fixed overhead, ``a`` the per-token cost and ``b`` the cost per
 """
 
 import json
-import logging
 import math
-import statistics
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
-
-from vllm.logger import init_logger
-
 if TYPE_CHECKING:
     from vllm.v1.request import Request
-
-logger = init_logger(__name__)
 
 # Chunk sizes are rounded down to a multiple of this. Prefill kernels (e.g.
 # TRTLLM attention on B300) run 10-30% slower on chunks that are not a
@@ -59,9 +51,6 @@ class ChunkCostModel:
         """Compute needed to prefill positions ``[L0, N)``, however chunked."""
         return self.a * (N - L0) + self.b * (N * N - L0 * L0) / 2
 
-    def predict(self, c: int, L: int) -> float:
-        return self.o + self.work(c, L)
-
     @classmethod
     def from_json(cls, text: str) -> "ChunkCostModel":
         try:
@@ -78,84 +67,6 @@ class ChunkCostModel:
                 f"a + b > 0, got {text!r}"
             )
         return model
-
-
-@dataclass
-class FitReport:
-    fit_error: float
-    """Mean absolute percentage error of the fit over all samples."""
-    num_samples: int
-    o_floored: bool
-    """True if ``o`` was clamped to its lower bound."""
-
-
-def _weighted_nnls(
-    phi: np.ndarray, t: np.ndarray, fixed: np.ndarray | None = None
-) -> np.ndarray:
-    """Relative-error weighted least squares with coefficients clamped at 0.
-
-    Each row is scaled by ``1 / t`` because the timing noise grows with the
-    duration. A negative coefficient is fixed at zero and the rest refitted,
-    at most three times.
-    """
-    num_feats = phi.shape[1]
-    w = 1.0 / t
-    coef = np.zeros(num_feats)
-    free = np.ones(num_feats, dtype=bool)
-    if fixed is not None:
-        free &= ~np.isfinite(fixed)
-        coef[~free] = fixed[~free]
-    for _ in range(3):
-        if not free.any():
-            break
-        resid = t - phi[:, ~free] @ coef[~free]
-        sol, *_ = np.linalg.lstsq(phi[:, free] * w[:, None], resid * w, rcond=None)
-        coef[free] = sol
-        negative = free & (coef < 0)
-        if not negative.any():
-            break
-        coef[negative] = 0.0
-        free &= ~negative
-    return np.maximum(coef, 0.0)
-
-
-def fit_chunk_cost(
-    samples: list[tuple[int, int, float]], o_floor_frac: float = 0.01
-) -> tuple[ChunkCostModel, FitReport]:
-    """Fit ``o, a, b`` to ``(chunk_size, prefix_len, time_ms)`` samples.
-
-    ``o`` is clamped to ``o_floor_frac`` of the median sample time: a fit
-    with ``o -> 0`` would drive the target time to zero and squeeze every
-    chunk down to the minimum size.
-
-    Raises:
-        ValueError: fewer than two distinct chunk sizes or prefix lengths.
-
-    """
-    if len({c for c, _, _ in samples}) < 2 or len({L for _, L, _ in samples}) < 2:
-        raise ValueError(
-            "fitting the chunk cost model needs at least two distinct chunk "
-            "sizes and two distinct prefix lengths"
-        )
-    if any(t <= 0 for _, _, t in samples):
-        raise ValueError("chunk cost samples must have positive durations")
-
-    phi = np.array([[1.0, c, c * (L + c / 2)] for c, L, _ in samples])
-    t = np.array([t for _, _, t in samples], dtype=float)
-    coef = _weighted_nnls(phi, t)
-
-    o_floor = o_floor_frac * statistics.median(t.tolist())
-    o_floored = coef[0] < o_floor
-    if o_floored:
-        fixed = np.array([o_floor, np.nan, np.nan])
-        coef = _weighted_nnls(phi, t, fixed=fixed)
-
-    cost = ChunkCostModel(o=float(coef[0]), a=float(coef[1]), b=float(coef[2]))
-    pred = phi @ coef
-    fit_error = float(np.mean(np.abs(pred - t) / t))
-    return cost, FitReport(
-        fit_error=fit_error, num_samples=len(samples), o_floored=o_floored
-    )
 
 
 class PPChunkPlanner:
@@ -233,17 +144,10 @@ class PPChunkPlanner:
             return remaining
         return aligned
 
-    def predict_ttft(self, N: int, L0: int, T: float) -> float:
-        """Closed-form TTFT (ms) of an equal-time split at target ``T``."""
-        W = self.cost.total_work(N, L0)
-        if W <= 0:
-            return self.cost.o * self.pp_size
-        return W + W * self.cost.o / (T - self.cost.o) + (self.pp_size - 1) * T
-
     def queue_target_time(
         self,
         queue: Iterable["Request"],
-        computed_tokens: Callable[["Request"], int] | None = None,
+        computed_tokens: Callable[["Request"], int],
     ) -> float:
         """Step target (ms) minimizing the mean TTFT of the queued prefills.
 
@@ -256,10 +160,9 @@ class PPChunkPlanner:
 
         ``computed_tokens`` gives the prefix each request starts from, so that
         waiting requests can be credited with their expected prefix-cache
-        hits; it defaults to ``num_computed_tokens``. The scan stops once the
-        head request's chunk alone would fill the token budget. Returns 0 with
-        fewer than two queued prefills, leaving a lone request at its own
-        target.
+        hits. The scan stops once the head request's chunk alone would fill
+        the token budget. Returns 0 with fewer than two queued prefills,
+        leaving a lone request at its own target.
         """
         if self.pp_size <= 1:
             return 0.0
@@ -269,11 +172,7 @@ class PPChunkPlanner:
         sum_cum_work = 0.0
         full_step_work = math.inf
         for request in queue:
-            L = (
-                computed_tokens(request)
-                if computed_tokens is not None
-                else request.num_computed_tokens
-            )
+            L = computed_tokens(request)
             if not _is_prefill(request, L):
                 continue
             N = request.num_tokens
@@ -291,20 +190,6 @@ class PPChunkPlanner:
         if num_reqs < 2:
             return 0.0
         return cost.o + math.sqrt(sum_cum_work / num_reqs * cost.o / (self.pp_size - 1))
-
-    def plan(self, N: int, L0: int, T: float | None = None) -> list[int]:
-        """Chunk sizes a lone request would get, in scheduling order."""
-        if T is None:
-            T = self.target_time(N, L0)
-        chunks: list[int] = []
-        L = L0
-        while L < N:
-            remaining = N - L
-            c = self.max_chunk(T - self.cost.o, L, remaining)
-            c = max(c, min(self.c_min, remaining))
-            chunks.append(c)
-            L += c
-        return chunks
 
 
 class PPChunkStep:
@@ -361,8 +246,7 @@ class PPChunkStep:
         self, request: "Request", num_computed_tokens: int, num_new_tokens: int
     ) -> None:
         """Charge a scheduled chunk against the step's budget."""
-        planner = self.planner
-        self.work_used += planner.cost.work(num_new_tokens, num_computed_tokens)
+        self.work_used += self.planner.cost.work(num_new_tokens, num_computed_tokens)
         if not _is_prefill(request, num_computed_tokens):
             return
         T = self._request_target(request, num_computed_tokens)
@@ -371,18 +255,6 @@ class PPChunkStep:
         if request.pp_chunk_target_ms is None:
             # First chunk: pin the target computed from this prefix length.
             request.pp_chunk_target_ms = T
-            if logger.isEnabledFor(logging.DEBUG):
-                N = request.num_tokens
-                logger.debug(
-                    "[pp-dyn-chunk] req=%s N=%d L0=%d T=%.2fms est_chunks=%d "
-                    "est_ttft=%.3fs",
-                    request.request_id,
-                    N,
-                    num_computed_tokens,
-                    T,
-                    len(planner.plan(N, num_computed_tokens, T)),
-                    planner.predict_ttft(N, num_computed_tokens, T) / 1000,
-                )
 
 
 def _is_prefill(request: "Request", num_computed_tokens: int) -> bool:
