@@ -128,18 +128,17 @@ llm = LLM(
 With pipeline parallelism, a long prompt's chunks flow through the stages one
 after another, so its TTFT depends on how the prompt is chunked: small chunks
 fill the pipeline sooner, large chunks spend less on per-step overhead.
-`--pp-dynamic-chunking` (off by default) sizes each prefill chunk by time
+`--pp-dynamic-chunking` (off by default) sizes prefill chunks by time
 instead of a fixed token budget. It requires the V2 model runner, async
 scheduling (on by default) and the FCFS policy.
 
-- A lone prompt is split into chunks that each take the same time, chosen to
-  minimize its TTFT; later chunks get fewer tokens as attention over the
-  prefix grows. A short tail after a long prefix-cache hit is split too, so
-  it is spread across the stages.
-- With two or more prefills queued, steps grow with the backlog to cut the
-  mean TTFT of the queue, and are at least as long as a chunk of
-  `--pp-dynamic-chunk-backlog-tokens` (default 2048) tokens, which favors
-  throughput under sustained load.
+- Every step is filled with prefill chunks up to the same time, so no step
+  holds up the pipeline; chunks get fewer tokens as attention over the prefix
+  grows.
+- The step time follows the TTFT of recently finished prefills. When the
+  engine is idle, steps are short, so a prompt, including a short tail after
+  a long prefix-cache hit, is spread across the stages. As requests queue up,
+  steps get longer and spend less time on per-step overhead.
 
 The chunk cost is profiled on every stage at startup and logged; pass the
 logged JSON as `--pp-dynamic-chunk-cost` to skip profiling.

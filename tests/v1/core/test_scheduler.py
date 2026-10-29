@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import math
 from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -4994,6 +4995,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.grammar_compile_error_reqs = {}
     scheduler.encoder_cache_mismatch_reqs = set()
     scheduler.vllm_config = Mock()
+    scheduler.pp_chunk_planner = None
     scheduler.return_sampling_mask = False
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
@@ -8903,7 +8905,6 @@ def test_pp_dynamic_chunking_single_long_prefill(monkeypatch):
         scheduler, lambda steps: _scheduled_so_far(steps, req.request_id) == N
     )
     chunks = [step[req.request_id] for step in steps]
-    assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
     assert chunks == pp_chunk_plan(planner, N, 0)
     assert all(a >= b for a, b in zip(chunks, chunks[1:]))
     assert chunks[0] == 3072
@@ -8914,7 +8915,7 @@ def test_pp_dynamic_chunking_single_long_prefill(monkeypatch):
 def _cache_prompt(scheduler, num_tokens: int) -> None:
     """Run one request to completion so its prompt lands in the prefix cache.
     It shares its prompt tokens with later requests created at index 0 or
-    with same_prompt=True."""
+    with same_prompt=True. Its wall-clock TTFT is not kept for the step time."""
     (req,) = create_requests(
         num_requests=1, num_tokens=num_tokens, max_tokens=1, req_ids=["a"]
     )
@@ -8933,6 +8934,7 @@ def _cache_prompt(scheduler, num_tokens: int) -> None:
                 pooler_output=[],
             ),
         )
+    scheduler.pp_chunk_planner._finished.clear()
 
 
 def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
@@ -8948,15 +8950,15 @@ def test_pp_dynamic_chunking_target_uses_prefix_cache_hit(monkeypatch):
     hit = req_b.num_computed_tokens - output.num_scheduled_tokens["b"]
     assert hit == 32 * 1024
     N = req_b.num_prompt_tokens
-    assert req_b.pp_chunk_target_ms == pytest.approx(planner.target_time(N, hit))
+    assert req_b.pp_chunk_work_ms == pytest.approx(planner.cost.total_work(N, hit))
     assert planner.target_time(N, hit) != pytest.approx(planner.target_time(N, 0))
     assert output.num_scheduled_tokens["b"] == pp_chunk_plan(planner, N, hit)[0]
 
 
-def test_pp_dynamic_chunking_queue_target_credits_waiting_prefix_hit(monkeypatch):
-    """Agentic backlog: waiting turns that mostly hit the prefix cache count
-    only their uncached tail toward the queue target, and each waiting
-    request's hit is looked up once."""
+def test_pp_dynamic_chunking_queue_credits_waiting_prefix_hit(monkeypatch):
+    """Agentic backlog before any prefill finishes: waiting turns that mostly
+    hit the prefix cache count only their uncached tail toward the step time,
+    and each waiting request's hit is looked up once."""
     scheduler, planner = _pp_chunk_scheduler(monkeypatch, enable_prefix_caching=True)
     hit = 32 * 1024
     _cache_prompt(scheduler, hit)
@@ -8980,69 +8982,39 @@ def test_pp_dynamic_chunking_queue_target_credits_waiting_prefix_hit(monkeypatch
     monkeypatch.setattr(kv_cache_manager, "peek_num_cached_tokens", counting_peek)
     queue = list(scheduler.waiting)
     for _ in range(2):
-        T, _ = planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
-    assert pytest.approx(planner.queue_target_time(queue, lambda r: hit)[0]) == T
-    assert planner.queue_target_time(queue, lambda r: 0)[0] > T
+        T = planner.step_target_time(queue, scheduler._pp_queue_computed_tokens)
+    assert planner.step_target_time(queue, lambda r: hit) == pytest.approx(T)
+    assert planner.step_target_time(queue, lambda r: 0) > T
     assert lookups == ["b", "c"]
 
 
-@pytest.mark.parametrize("fits_c_min", [True, False])
-def test_pp_dynamic_chunking_packs_next_request_into_last_chunk(
-    monkeypatch, fits_c_min: bool
-):
-    """B arrives just before A's last chunk. If that chunk leaves at least a
-    c_min chunk of A's target, B's first chunk rides in the same step within
-    the target; otherwise B waits for the next step and starts at its own
-    target. FCFS order holds either way."""
+def test_pp_dynamic_chunking_packs_requests_into_one_step(monkeypatch):
+    """Requests share a step's time: A's whole prompt goes first, then B's
+    first chunk takes what is left of the step target."""
     scheduler, planner = _pp_chunk_scheduler(monkeypatch)
     cost = planner.cost
-
-    def spare_ms(N: int) -> float:
-        last = pp_chunk_plan(planner, N, 0)[-1]
-        return planner.target_time(N, 0) - cost.o - cost.work(last, N - last)
-
-    N_a = next(
-        N
-        for N in range(128 * 1024, 132 * 1024, 64)
-        if (spare_ms(N) >= cost.work(PP_CHUNK_C_MIN, 0)) == fits_c_min
-    )
-    N_b = 16 * 1024
-    req_a, req_b = (
-        create_requests(num_requests=1, num_tokens=N, max_tokens=1, req_ids=[rid])[0]
-        for N, rid in ((N_a, "a"), (N_b, "b"))
-    )
-    scheduler.add_request(req_a)
-    last_a = pp_chunk_plan(planner, N_a, 0)[-1]
-
-    def add_b_before_last_chunk(steps):
-        if _scheduled_so_far(steps, "a") == N_a - last_a:
-            scheduler.add_request(req_b)
-            # The backlog is too small to raise the step target above A's.
-            queue_ms, _ = planner.queue_target_time(
-                [req_a, req_b], lambda r: r.num_computed_tokens
-            )
-            assert 0 < queue_ms < req_a.pp_chunk_target_ms
-            assert planner.backlog_target_time(2, 0) < req_a.pp_chunk_target_ms
-
-    steps = _drive_pp_prefill(
-        scheduler, lambda steps: "b" in steps[-1], add_b_before_last_chunk
-    )
-    assert _scheduled_so_far(steps, "a") == N_a
-    assert all("b" not in step for step in steps[:-1])
-    if fits_c_min:
-        assert list(steps[-1]) == ["a", "b"]
-        assert steps[-1]["b"] == planner.max_chunk(spare_ms(N_a), 0, N_b)
-        assert steps[-1]["b"] >= PP_CHUNK_C_MIN
-    else:
-        assert steps[-2] == {"a": last_a}
-        assert steps[-1] == {"b": pp_chunk_plan(planner, N_b, 0)[0]}
-        assert req_b.pp_chunk_target_ms == pytest.approx(planner.target_time(N_b, 0))
+    N_a, N_b = 1024, 200 * 1024
+    for N, rid in ((N_a, "a"), (N_b, "b")):
+        scheduler.add_request(
+            create_requests(num_requests=1, num_tokens=N, max_tokens=1, req_ids=[rid])[
+                0
+            ]
+        )
+    T = planner.step_target_time(list(scheduler.waiting), lambda r: 0)
+    output = scheduler.schedule()
+    left_ms = T - cost.o - cost.work(N_a, 0)
+    assert left_ms >= cost.work(PP_CHUNK_C_MIN, 0)
+    assert list(output.num_scheduled_tokens) == ["a", "b"]
+    assert output.num_scheduled_tokens == {
+        "a": N_a,
+        "b": planner.max_chunk(left_ms, 0, N_b),
+    }
 
 
-def test_pp_dynamic_chunking_backlog_raises_step_target(monkeypatch):
-    """With prefills queued behind A, the step target grows to cut their mean
-    TTFT: A's first chunk is larger than it would be alone, and more so with
-    a longer backlog, but never beyond the token budget."""
+def test_pp_dynamic_chunking_step_target_grows_with_queue(monkeypatch):
+    """Before any prefill finishes, more queued prefills make longer steps:
+    the head's first chunk is larger than alone, and more so with a longer
+    queue, but never beyond the token budget."""
     N = 128 * 1024
     first_chunks = []
     for num_reqs in (1, 2, 4, 32):
@@ -9052,42 +9024,50 @@ def test_pp_dynamic_chunking_backlog_raises_step_target(monkeypatch):
         reqs = create_requests(num_requests=num_reqs, num_tokens=N, max_tokens=1)
         for req in reqs:
             scheduler.add_request(req)
-        queue_ms, _ = planner.queue_target_time(reqs, lambda r: r.num_computed_tokens)
+        T = planner.step_target_time(reqs, lambda r: r.num_computed_tokens)
         output = scheduler.schedule()
-        assert list(output.num_scheduled_tokens) == [reqs[0].request_id]
         first = output.num_scheduled_tokens[reqs[0].request_id]
-        if num_reqs == 1:
-            assert queue_ms == 0
-            assert first == pp_chunk_plan(planner, N, 0)[0]
-        else:
-            assert first == planner.max_chunk(queue_ms - planner.cost.o, 0, N)
-        # A's own target stays its single-request optimum.
-        assert reqs[0].pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
+        assert first == max(planner.max_chunk(T - planner.cost.o, 0, N), PP_CHUNK_C_MIN)
         first_chunks.append(first)
+    assert first_chunks[0] == pp_chunk_plan(planner, N, 0)[0]
     assert first_chunks[0] < first_chunks[1] < first_chunks[2]
     assert first_chunks[3] == 8192
 
 
-def test_pp_dynamic_chunking_backlog_floors_short_prompts(monkeypatch):
-    """Short prompts alone get small chunks, but with others queued each step
-    grows to at least a backlog_tokens chunk, above the queue target."""
-    N = 8192
-    for num_reqs in (1, 2, 6):
-        scheduler, planner = _pp_chunk_scheduler(
-            monkeypatch, max_num_batched_tokens=8192
-        )
-        reqs = create_requests(num_requests=num_reqs, num_tokens=N, max_tokens=1)
-        for req in reqs:
-            scheduler.add_request(req)
-        queue_ms, _ = planner.queue_target_time(reqs, lambda r: r.num_computed_tokens)
-        output = scheduler.schedule()
-        head = reqs[0].request_id
-        assert list(output.num_scheduled_tokens) == [head]
-        if num_reqs == 1:
-            assert output.num_scheduled_tokens[head] == PP_CHUNK_C_MIN
-        else:
-            assert queue_ms < planner.backlog_target_time(num_reqs, 0)
-            assert output.num_scheduled_tokens[head] == planner.backlog_tokens
+def test_pp_dynamic_chunking_records_first_token(monkeypatch):
+    """A prefill's first token feeds its TTFT, the part of it spent before
+    its last chunk left the first stage, and its own work into the step
+    time."""
+    scheduler, planner = _pp_chunk_scheduler(monkeypatch)
+    N = PP_CHUNK_C_MIN
+    (req,) = create_requests(num_requests=1, num_tokens=N, max_tokens=4)
+    scheduler.add_request(req)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[req.request_id] == N
+    last_step_ms = req.pp_chunk_last_step_ms
+    assert last_step_ms == pytest.approx(planner.target_time(N, 0))
+    # Pretend the first token comes back 2 s after the request arrived.
+    req.pp_chunk_arrival_s -= 2.0
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[req.request_id],
+            req_id_to_index={req.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert req.pp_chunk_arrival_s is None
+    ((ttft, queued, work, overhead),) = planner._finished
+    assert ttft == pytest.approx(2000, abs=100)
+    assert queued == pytest.approx(ttft - 3 * last_step_ms)
+    assert work == pytest.approx(planner.cost.total_work(N, 0))
+    assert overhead == planner.cost.o
+    o = planner.cost.o
+    expected = o + math.sqrt(o * ttft * (queued / work) / 3)
+    assert planner.step_target_time([], lambda r: 0) == pytest.approx(expected)
 
 
 def test_pp_dynamic_chunking_spec_decode_padding(monkeypatch):
@@ -9106,7 +9086,7 @@ def test_pp_dynamic_chunking_spec_decode_padding(monkeypatch):
 
     assert out.num_scheduled_tokens[resumed.request_id] == 1 + num_spec
     assert out.scheduled_spec_decode_tokens[resumed.request_id] == [-1] * num_spec
-    assert resumed.pp_chunk_target_ms is None
+    assert resumed.pp_chunk_work_ms is None
 
 
 def test_pp_dynamic_chunking_config_validation(monkeypatch):
@@ -9136,22 +9116,23 @@ def test_pp_dynamic_chunking_config_validation(monkeypatch):
         assert scheduler.pp_chunk_planner is None
 
 
-def test_pp_dynamic_chunking_preemption_resets_target(monkeypatch):
-    """Preemption discards the prefix, so T is recomputed on resumption."""
+def test_pp_dynamic_chunking_preemption_resets_request(monkeypatch):
+    """Preemption discards the prefix, so the request's work is recomputed
+    from where it resumes."""
     scheduler, planner = _pp_chunk_scheduler(monkeypatch)
     N = 128 * 1024
     (req,) = create_requests(num_requests=1, num_tokens=N, max_tokens=1)
     scheduler.add_request(req)
     output = scheduler.schedule()
-    assert req.pp_chunk_target_ms is not None
+    assert req.pp_chunk_work_ms is not None
 
     scheduler.running.remove(req)
     scheduler._preempt_request(req, 0.0)
-    assert req.pp_chunk_target_ms is None
+    assert req.pp_chunk_work_ms is None
 
     scheduler.update_from_output(output, _prefill_chunk_output(output))
     output = scheduler.schedule()
     assert req.status == RequestStatus.RUNNING
-    assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, 0))
+    assert req.pp_chunk_work_ms == pytest.approx(planner.cost.total_work(N, 0))
     first_chunk = output.num_scheduled_tokens[req.request_id]
     assert first_chunk == pp_chunk_plan(planner, N, 0)[0]

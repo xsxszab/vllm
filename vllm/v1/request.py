@@ -199,10 +199,17 @@ class Request:
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
-        # Per-chunk time target under pp_dynamic_chunking; set when the first
-        # chunk is scheduled and reset on preemption, since the prefix changes.
-        self.pp_chunk_target_ms: float | None = None
-        # Local prefix-cache hit estimated while waiting, for the queue target.
+        # pp_dynamic_chunking: when the scheduler received the request
+        # (time.monotonic()), cleared once its first token is recorded.
+        self.pp_chunk_arrival_s: float | None = None
+        # Its compute and fixed cost per chunk (ms) from where its first chunk
+        # started, and the step time when its last chunk was scheduled; reset
+        # on preemption, since the prefix changes.
+        self.pp_chunk_work_ms: float | None = None
+        self.pp_chunk_overhead_ms: float | None = None
+        self.pp_chunk_last_step_ms: float | None = None
+        # Local prefix-cache hit estimated while waiting, for the step time
+        # before any prefill has finished.
         self.pp_chunk_est_cached_tokens: int | None = None
 
         # Block-aligned token position of a proven shared prefix worth pinning

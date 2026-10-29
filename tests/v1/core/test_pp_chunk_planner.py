@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the equal-time PP prefill chunk planner (CPU only)."""
+"""Unit tests for the equal-time PP prefill step planner (CPU only)."""
 
 import math
 from types import SimpleNamespace
@@ -23,11 +23,10 @@ MLA_COST = ChunkCostModel(o=2.0, a=0.03, b=1.3e-6, e=1.5e-4)
 GRAN = 64
 C_MIN = 512
 C_MAX = 32768
-BACKLOG = 2048
 
 
 def make_planner(pp_size: int, c_max: int = C_MAX) -> PPChunkPlanner:
-    return PPChunkPlanner(COST, pp_size, GRAN, C_MIN, c_max, BACKLOG)
+    return PPChunkPlanner(COST, pp_size, GRAN, C_MIN, c_max)
 
 
 def predict(c: int, L: int) -> float:
@@ -50,7 +49,9 @@ def _req(num_tokens: int, num_computed_tokens: int = 0, **kwargs) -> SimpleNames
     return SimpleNamespace(
         num_tokens=num_tokens,
         num_computed_tokens=num_computed_tokens,
-        pp_chunk_target_ms=None,
+        pp_chunk_work_ms=None,
+        pp_chunk_overhead_ms=None,
+        pp_chunk_last_step_ms=None,
         **kwargs,
     )
 
@@ -109,14 +110,10 @@ def test_max_chunk_boundaries():
         assert planner.max_chunk(COST.work(2048, L), L, 1 << 20) == 2048
 
 
-def test_target_time_bounds():
+def test_target_time_starts_from_prefix():
+    """Planning starts from the computed prefix (e.g. a prefix-cache hit)."""
     planner = make_planner(4)
     N = 128 * 1024
-    assert planner.target_time(2048, 0) >= predict(C_MIN, 0)
-    assert planner.target_time(1 << 20, 0) <= predict(C_MAX, 0)
-    # A remainder shorter than c_min bounds T by the remainder.
-    assert planner.target_time(2048, 1948) == pytest.approx(predict(100, 1948))
-    # Planning starts from the computed prefix (e.g. a prefix-cache hit).
     assert planner.target_time(N, 65536) < planner.target_time(N, 0)
     assert planner.target_time(N, N) == COST.o
 
@@ -150,67 +147,62 @@ def test_fit_recovers_coefficients(cost: ChunkCostModel):
         fit_chunk_cost([(c, 0, t) for c, _, t in samples])
 
 
-def test_queue_target_uses_mean_cumulative_work():
-    """FCFS backlog: T* is taken for the mean of each request's work plus the
-    work queued ahead of it."""
+def test_step_target_before_any_finish_treats_queue_as_batch():
+    """Before any prefill finishes, T is taken for the queued prefills served
+    as one FCFS batch: each one's TTFT is its work plus the work ahead of it."""
     planner = make_planner(4)
     N = 64 * 1024
     queue = [_req(N), _req(N, 1024), _req(N)]
     cum = np.cumsum([COST.total_work(N, r.num_computed_tokens) for r in queue])
     expected = COST.o + math.sqrt(cum.mean() * COST.o / 3)
-    assert planner.queue_target_time(queue, _computed) == (pytest.approx(expected), 3)
-    # A lone prefill keeps its own target; one token left is a decode.
-    assert planner.queue_target_time([_req(N)], _computed) == (0, 1)
-    assert planner.queue_target_time([_req(N), _req(N, N - 1)], _computed) == (0, 1)
-
-
-def test_queue_target_grows_with_backlog_and_bounds_scan():
-    N = 32 * 1024
-    planner = make_planner(4, c_max=4096)
-    targets = [
-        planner.queue_target_time([_req(N)] * k, _computed)[0] for k in (2, 4, 8)
-    ]
-    assert targets == sorted(targets)
+    assert planner.step_target_time(queue, _computed) == pytest.approx(expected)
+    # A lone prefill gets its own optimum; one token left is a decode.
+    lone = planner.target_time(N, 0)
+    assert planner.step_target_time([_req(N)], _computed) == pytest.approx(lone)
+    assert planner.step_target_time(
+        [_req(N), _req(N, N - 1)], _computed
+    ) == pytest.approx(lone)
 
     def endless(counter):
         while True:
             counter.append(None)
             yield _req(N)
 
-    # Stops once the head's chunk alone fills the token budget.
     consumed: list[None] = []
-    T, _ = planner.queue_target_time(endless(consumed), _computed)
-    assert T - COST.o >= COST.work(4096, 0)
-    assert len(consumed) < 64
-    # Otherwise the scan is bounded.
-    consumed = []
-    make_planner(4).queue_target_time(endless(consumed), _computed)
+    planner.step_target_time(endless(consumed), _computed)
     assert len(consumed) == 64
 
 
-def test_backlog_target_time():
-    """A backlog floors steps at a BACKLOG-token chunk, costed at prefix 0 up
-    to pp_size prefills and at the scheduled prefix beyond."""
+def test_step_target_from_finished_prefills():
+    """Once prefills finish, T follows their mean TTFT, scaled up by how much
+    of it was spent queued rather than computing."""
     planner = make_planner(4)
-    L = 65536
-    assert planner.backlog_target_time(1, L) == 0
-    assert planner.backlog_target_time(4, L) == pytest.approx(predict(BACKLOG, 0))
-    assert planner.backlog_target_time(5, L) == pytest.approx(predict(BACKLOG, L))
-    small = make_planner(4, c_max=1024)
-    assert small.backlog_target_time(2, 0) == pytest.approx(predict(1024, 0))
+    o, S = COST.o, 4
+    # TTFT 400 ms, of which 3 * 20 ms crossing the later stages: 340 ms until
+    # the last chunk left the first stage, for 100 ms of own compute.
+    for _ in range(40):
+        planner.record_first_token(400.0, 20.0, 100.0, o)
+    expected = o + math.sqrt(o * 400.0 * 3.4 / (S - 1))
+    queue = [_req(1 << 20)]
+    assert planner.step_target_time(queue, _computed) == pytest.approx(expected)
+    # Only the last 32 count, and the queue ratio never drops below 1.
+    for _ in range(32):
+        planner.record_first_token(100.0, 20.0, 100.0, o)
+    expected = o + math.sqrt(o * 100.0 / (S - 1))
+    assert planner.step_target_time(queue, _computed) == pytest.approx(expected)
 
 
-def test_prefix_cost_splits_less_and_is_charged_per_request():
+def test_step_charges_each_prefill_its_prefix_cost():
     """With a per-chunk prefix cost, a tail behind a long prefix gets fewer
     chunks, and each prefill packed into a step pays its own prefix cost, so
     the step stays within its target."""
-    mla_planner = PPChunkPlanner(MLA_COST, 4, GRAN, C_MIN, C_MAX, BACKLOG)
+    mla_planner = PPChunkPlanner(MLA_COST, 4, GRAN, C_MIN, C_MAX)
     L = 65536
     N = L + 16384
     assert len(plan(mla_planner, N, L)) < len(plan(make_planner(4), N, L))
 
     T = 300.0
-    step = PPChunkStep(mla_planner, queue_target_ms=T, num_queued_prefills=2)
+    step = PPChunkStep(mla_planner, T)
     packed = []
     for req in (_req(L + 1024, L), _req(L + 4096, L)):
         c = step.cap(req, L, req.num_tokens - L)
@@ -221,13 +213,23 @@ def test_prefix_cost_splits_less_and_is_charged_per_request():
     assert step_ms <= T
 
 
-def test_step_caps_resumed_output_tokens():
-    """A preempted request recomputes its outputs as prefill too."""
+def test_step_records_work_and_last_step():
+    """The first chunk records the request's work from where it started, and
+    the chunk that completes it records the step time. A preempted request
+    recomputes its outputs as prefill too."""
     planner = make_planner(4)
     N, prompt = 100_000, 60_000
     req = _req(N, prompt, num_prompt_tokens=prompt)
-    step = PPChunkStep(planner)
+    T = planner.target_time(N, prompt)
+    step = PPChunkStep(planner, T)
     cap = step.cap(req, prompt, C_MAX)
     assert cap == plan(planner, N, prompt)[0] < C_MAX
     step.commit(req, prompt, cap)
-    assert req.pp_chunk_target_ms == pytest.approx(planner.target_time(N, prompt))
+    assert req.pp_chunk_work_ms == pytest.approx(COST.total_work(N, prompt))
+    assert req.pp_chunk_last_step_ms is None
+
+    L = N - 512
+    step = PPChunkStep(planner, T)
+    step.commit(req, L, step.cap(req, L, 512))
+    assert req.pp_chunk_work_ms == pytest.approx(COST.total_work(N, prompt))
+    assert req.pp_chunk_last_step_ms == T

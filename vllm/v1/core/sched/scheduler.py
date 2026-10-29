@@ -164,7 +164,6 @@ class Scheduler(SchedulerInterface):
                     self.max_num_scheduled_tokens,
                 ),
                 c_max=self.max_num_scheduled_tokens,
-                backlog_tokens=self.scheduler_config.pp_dynamic_chunk_backlog_tokens,
             )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
@@ -753,14 +752,12 @@ class Scheduler(SchedulerInterface):
         # Equal-time prefill chunking (pp_dynamic_chunking).
         pp_step = None
         if self.pp_chunk_planner is not None:
-            queue_target_ms, num_queued_prefills = (
-                self.pp_chunk_planner.queue_target_time(
+            pp_step = PPChunkStep(
+                self.pp_chunk_planner,
+                self.pp_chunk_planner.step_target_time(
                     itertools.chain(self.running, self.waiting),
                     self._pp_queue_computed_tokens,
-                )
-            )
-            pp_step = PPChunkStep(
-                self.pp_chunk_planner, queue_target_ms, num_queued_prefills
+                ),
             )
 
         # For logging.
@@ -1825,11 +1822,30 @@ class Scheduler(SchedulerInterface):
             return None
         return new_block_ids_to_zero or None
 
+    def _pp_record_first_token(self, request: Request) -> None:
+        """Feed a prefill's TTFT to pp_dynamic_chunking. Requests whose prompt
+        was never prefilled in chunks (e.g. a full prefix-cache hit) are
+        skipped."""
+        assert self.pp_chunk_planner is not None
+        assert request.pp_chunk_arrival_s is not None
+        if (
+            request.pp_chunk_last_step_ms is not None
+            and request.pp_chunk_work_ms is not None
+            and request.pp_chunk_overhead_ms is not None
+        ):
+            self.pp_chunk_planner.record_first_token(
+                ttft_ms=1000 * (time.monotonic() - request.pp_chunk_arrival_s),
+                last_step_ms=request.pp_chunk_last_step_ms,
+                work_ms=request.pp_chunk_work_ms,
+                overhead_ms=request.pp_chunk_overhead_ms,
+            )
+        request.pp_chunk_arrival_s = None
+
     def _pp_queue_computed_tokens(self, request: Request) -> int:
         """Prefix a queued request starts from, for the pp_dynamic_chunking
-        queue target. A waiting request's local prefix-cache hit is looked up
-        once and reused while it waits; external (connector) hits are unknown
-        and not counted."""
+        step time before any prefill has finished. A waiting request's local
+        prefix-cache hit is looked up once and reused while it waits; external
+        (connector) hits are unknown and not counted."""
         if request.num_computed_tokens > 0:
             return request.num_computed_tokens
         if request.pp_chunk_est_cached_tokens is None:
@@ -1862,7 +1878,9 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
-        request.pp_chunk_target_ms = None
+        request.pp_chunk_work_ms = None
+        request.pp_chunk_overhead_ms = None
+        request.pp_chunk_last_step_ms = None
         request.pp_chunk_est_cached_tokens = None
         if request.spec_token_ids:
             request.spec_token_ids = []
@@ -2443,6 +2461,11 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
+                if (
+                    self.pp_chunk_planner is not None
+                    and request.pp_chunk_arrival_s is not None
+                ):
+                    self._pp_record_first_token(request)
                 has_output_placeholders = request.num_output_placeholders > 0
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
@@ -2988,6 +3011,8 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if self.pp_chunk_planner is not None:
+                request.pp_chunk_arrival_s = time.monotonic()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":

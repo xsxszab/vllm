@@ -90,13 +90,12 @@ class SchedulerConfig:
     long_prefill_token_threshold is nonzero."""
 
     pp_dynamic_chunking: bool = False
-    """Size prefill chunks by a per-chunk time target instead of the token
+    """Size prefill chunks by a per-step time target instead of the token
     budget, for prefill under pipeline parallelism with async scheduling.
-    Each chunk's duration is predicted by `pp_dynamic_chunk_cost`, and every
-    chunk of a prompt is sized to take the same time, which minimizes the
-    prompt's TTFT across the pipeline stages; with a backlog of prefills the
-    target grows to minimize their mean TTFT, and is at least the time of a
-    `pp_dynamic_chunk_backlog_tokens` chunk. Requires
+    Chunk durations are predicted by `pp_dynamic_chunk_cost`, and every step
+    is filled up to the same time, chosen from the TTFT of recently finished
+    prefills: short when the engine is idle, so that a prompt is spread over
+    the pipeline stages, and longer as requests queue up. Requires
     `pipeline_parallel_size > 1`, chunked prefill, the FCFS policy and the V2
     model runner; incompatible with `long_prefill_token_threshold`. Off by
     default."""
@@ -104,12 +103,6 @@ class SchedulerConfig:
     pp_dynamic_chunk_min_tokens: int = Field(default=512, ge=1)
     """Smallest prefill chunk `pp_dynamic_chunking` schedules. Keeps GEMMs
     out of the memory-bandwidth-bound regime; MoE models may want 1024-2048."""
-
-    pp_dynamic_chunk_backlog_tokens: int = Field(default=2048, ge=1)
-    """With two or more prefills queued, `pp_dynamic_chunking` makes every step
-    at least as long as a prefill chunk of this many tokens, trading the
-    pipeline fill of the head request for throughput. Set it near the best
-    fixed `max_num_batched_tokens` under load."""
 
     pp_dynamic_chunk_cost: str | None = None
     """JSON object `{"o": ms, "a": ms/token, "b": ms/(q,k) pair, "e":
