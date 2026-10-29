@@ -441,7 +441,7 @@ def pp_chunk_plan(planner, N: int, L0: int, T: float | None = None) -> list[int]
     chunks: list[int] = []
     L = L0
     while L < N:
-        c = planner.max_chunk(T - planner.cost.o, L, N - L)
+        c = planner.max_chunk(T - planner.cost.overhead(L), L, N - L)
         c = max(c, min(planner.c_min, N - L))
         chunks.append(c)
         L += c

@@ -4,8 +4,8 @@
 
 Every pipeline stage times its own forward pass on synthetic chunked prefills
 over a grid of chunk sizes and prefix lengths, without the inter-stage
-send/recv. The engine fits ``d(c, L) = o + a * c + b * c * (L + c / 2)`` to
-the slowest stage at each grid point and hands it to the scheduler.
+send/recv. The engine fits ``d(c, L) = o + e * L + a * c + b * c * (L + c / 2)``
+to the slowest stage at each grid point and hands it to the scheduler.
 """
 
 import json
@@ -73,15 +73,15 @@ def fit_chunk_cost(
             "fitting the chunk cost model needs at least two distinct chunk "
             "sizes and two distinct prefix lengths"
         )
-    phi = np.array([[1.0, c, c * (L + c / 2)] for c, L, _ in samples])
+    phi = np.array([[1.0, L, c, c * (L + c / 2)] for c, L, _ in samples])
     t = np.array([t for _, _, t in samples], dtype=float)
     coef = _nonneg_lstsq(phi, t)
     o_floor = _O_FLOOR_FRAC * float(np.median(t))
     if coef[0] < o_floor:
         coef = np.concatenate(([o_floor], _nonneg_lstsq(phi[:, 1:], t - o_floor)))
     fit_error = float(np.mean(np.abs(phi @ coef - t) / t))
-    o, a, b = (float(x) for x in coef)
-    return ChunkCostModel(o=o, a=a, b=b), fit_error
+    o, e, a, b = (float(x) for x in coef)
+    return ChunkCostModel(o=o, a=a, b=b, e=e), fit_error
 
 
 @torch.inference_mode()
@@ -171,7 +171,7 @@ def profile_pp_chunk_cost(
         scheduler_config.pp_dynamic_chunking = False
         return
     scheduler_config.pp_dynamic_chunk_cost = json.dumps(
-        {"o": cost.o, "a": cost.a, "b": cost.b}
+        {"o": cost.o, "a": cost.a, "b": cost.b, "e": cost.e}
     )
     logger.info(
         "pp_dynamic_chunking: profiled %d points on %d stages, cost model %s "

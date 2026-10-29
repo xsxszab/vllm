@@ -18,6 +18,8 @@ from vllm.v1.core.sched.pp_chunk_profile import fit_chunk_cost
 from .utils import pp_chunk_plan as plan
 
 COST = ChunkCostModel(o=2.0, a=0.03, b=1.3e-6)
+# Every chunk also pays for its prefix, as MLA does to up-project cached KV.
+MLA_COST = ChunkCostModel(o=2.0, a=0.03, b=1.3e-6, e=1.5e-4)
 GRAN = 64
 C_MIN = 512
 C_MAX = 32768
@@ -119,18 +121,24 @@ def test_target_time_bounds():
     assert planner.target_time(N, N) == COST.o
 
 
-def test_fit_recovers_coefficients():
+@pytest.mark.parametrize("cost", [COST, MLA_COST])
+def test_fit_recovers_coefficients(cost: ChunkCostModel):
     rng = np.random.default_rng(0)
-    samples = [
-        (c, L, predict(c, L) * (1 + 0.03 * rng.standard_normal()))
-        for L in (0, 16384, 65536)
-        for c in (512, 1024, 2048, 4096, 8192, 16384)
-    ]
-    cost, fit_error = fit_chunk_cost(samples)
-    assert cost.a == pytest.approx(COST.a, rel=0.05)
-    assert cost.b == pytest.approx(COST.b, rel=0.05)
-    assert abs(cost.o - COST.o) <= 0.5
+    samples = []
+    for L in (0, 16384, 65536):
+        for c in (512, 1024, 2048, 4096, 8192, 16384):
+            t = cost.overhead(L) + cost.work(c, L)
+            samples.append((c, L, t * (1 + 0.03 * rng.standard_normal())))
+    fitted, fit_error = fit_chunk_cost(samples)
+    assert fitted.a == pytest.approx(cost.a, rel=0.05)
+    assert fitted.b == pytest.approx(cost.b, rel=0.05)
+    assert abs(fitted.o - cost.o) <= 0.5
+    # The 3% noise is ~2 ms on the shortest chunk at the longest prefix, where
+    # MLA_COST's prefix cost is ~10 ms.
+    assert abs(fitted.e - cost.e) * 65536 <= 3.0
     assert fit_error <= 0.05
+    if cost is MLA_COST:
+        return
 
     # A negative intercept would push T* to zero; o is floored instead.
     shifted = [(c, L, t - COST.o - 1.0) for c, L, t in samples]
@@ -190,6 +198,27 @@ def test_backlog_target_time():
     assert planner.backlog_target_time(5, L) == pytest.approx(predict(BACKLOG, L))
     small = make_planner(4, c_max=1024)
     assert small.backlog_target_time(2, 0) == pytest.approx(predict(1024, 0))
+
+
+def test_prefix_cost_splits_less_and_is_charged_per_request():
+    """With a per-chunk prefix cost, a tail behind a long prefix gets fewer
+    chunks, and each prefill packed into a step pays its own prefix cost, so
+    the step stays within its target."""
+    mla_planner = PPChunkPlanner(MLA_COST, 4, GRAN, C_MIN, C_MAX, BACKLOG)
+    L = 65536
+    N = L + 16384
+    assert len(plan(mla_planner, N, L)) < len(plan(make_planner(4), N, L))
+
+    T = 300.0
+    step = PPChunkStep(mla_planner, queue_target_ms=T, num_queued_prefills=2)
+    packed = []
+    for req in (_req(L + 1024, L), _req(L + 4096, L)):
+        c = step.cap(req, L, req.num_tokens - L)
+        step.commit(req, L, c)
+        packed.append(c)
+    assert packed[0] == 1024 and packed[1] > 0
+    step_ms = MLA_COST.o + sum(MLA_COST.e * L + MLA_COST.work(c, L) for c in packed)
+    assert step_ms <= T
 
 
 def test_step_caps_resumed_output_tokens():

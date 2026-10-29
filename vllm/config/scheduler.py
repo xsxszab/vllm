@@ -112,11 +112,13 @@ class SchedulerConfig:
     fixed `max_num_batched_tokens` under load."""
 
     pp_dynamic_chunk_cost: str | None = None
-    """JSON object `{"o": ms, "a": ms/token, "b": ms/(q,k) pair}` giving the
-    `pp_dynamic_chunking` cost model of one prefill chunk on the slowest
-    pipeline stage: `o + a * c + b * c * (L + c / 2)` for a chunk of `c`
-    tokens after a prefix of `L`. If unset, every stage is profiled at startup
-    and the fitted model is logged, so it can be passed here to skip that."""
+    """JSON object `{"o": ms, "a": ms/token, "b": ms/(q,k) pair, "e":
+    ms/prefix token}` giving the `pp_dynamic_chunking` cost model of one
+    prefill chunk on the slowest pipeline stage:
+    `o + e * L + a * c + b * c * (L + c / 2)` for a chunk of `c` tokens after
+    a prefix of `L`; `e` is optional and defaults to 0. If unset, every stage
+    is profiled at startup and the fitted model is logged, so it can be passed
+    here to skip that."""
 
     max_num_queued_reqs: int | None = Field(default=None, ge=0)
     """Maximum number of requests that can be in-flight (waiting or running)
