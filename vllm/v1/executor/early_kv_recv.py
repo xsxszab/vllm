@@ -11,6 +11,7 @@ import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.distributed.utils import sched_yield
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_zmq_ipc_path, make_zmq_socket
 from vllm.v1.outputs import KVConnectorOutput
@@ -135,6 +136,41 @@ class EarlyKVRecvSender:
                 self._trace_rpc_after_wait_s += slept
         # An RPC may have arrived during the bounded wait. Leave it for dequeue.
         return not rpc_mq.shutting_down and not rpc_mq.readable()
+
+    def time_until_poll(self) -> float | None:
+        """Seconds until the next poll is due, or None if no poll is needed."""
+        if self._trace_no_spin:
+            return None
+        now = time.perf_counter()
+        if (
+            now - self._last_activity > _ACTIVE_WINDOW_S
+            or not has_kv_transfer_group()
+            or not get_kv_transfer_group().has_pending_recving()
+        ):
+            return None
+        return max(0.0, self._next_poll - now)
+
+    def wait_for_rpc(self, rpc_mq: MessageQueue, timeout: float) -> bool:
+        """Spin up to `timeout` seconds for the next RPC.
+
+        Returns True once an RPC is readable or the queue is shutting down (so
+        dequeue() handles it), False when the poll is due.
+        """
+        start = time.perf_counter()
+        deadline = start + timeout
+        ready = False
+        while True:
+            if rpc_mq.shutting_down or rpc_mq.readable():
+                ready = True
+                break
+            if time.perf_counter() >= deadline:
+                break
+            sched_yield()
+        self._trace_wait_s += time.perf_counter() - start
+        self._trace_waits += 1
+        if ready:
+            self._trace_rpc_after_wait += 1
+        return ready
 
     def poll(self) -> None:
         """Send completed receives; let the worker monitor handle fatal errors."""

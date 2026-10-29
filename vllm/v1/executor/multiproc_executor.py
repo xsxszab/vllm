@@ -1211,6 +1211,12 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers."""
         assert self.rpc_broadcast_mq is not None
+        # EXPERIMENT ONLY (not for upstream): single-wait loop for the A/B.
+        if (
+            self.early_kv_recv is not None
+            and os.environ.get("VLLM_EARLY_RECV_LOOP") == "1"
+        ):
+            return self._single_wait_busy_loop()
         while True:
             if (early_kv_recv := self.early_kv_recv) is not None:
                 while True:
@@ -1235,6 +1241,30 @@ class WorkerProc:
                     # with its output, ready only once the GPU finishes it.
                     # A synchronous replying worker polls in enqueue_output().
                     early_kv_recv.poll()
+            del rpc_request
+
+    def _single_wait_busy_loop(self):
+        """Run a due poll before the next RPC; otherwise wait for an RPC only
+        until the next poll is due."""
+        rpc_mq = self.rpc_broadcast_mq
+        early_kv_recv = self.early_kv_recv
+        assert rpc_mq is not None and early_kv_recv is not None
+        logger.info("EARLY_RECV_TRACE single_wait_loop active")
+        while True:
+            timeout = early_kv_recv.time_until_poll()
+            if timeout is not None:
+                if timeout <= 0:
+                    get_watch_dog().feed()
+                    early_kv_recv.poll()
+                    continue
+                with get_watch_dog().disable():
+                    if not early_kv_recv.wait_for_rpc(rpc_mq, timeout):
+                        continue
+            with get_watch_dog().disable():
+                rpc_request = rpc_mq.dequeue(indefinite=True)
+            self._execute_worker_rpc(rpc_request)
+            if rpc_request[0] in ("execute_model", "sample_tokens"):
+                early_kv_recv.step_rpc_done()
             del rpc_request
 
     def _execute_worker_rpc(
