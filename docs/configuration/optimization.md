@@ -135,8 +135,8 @@ scheduling (on by default) and the FCFS policy.
 - Every step is filled with prefill chunks up to the same time, so no step
   holds up the pipeline; chunks get fewer tokens as attention over the prefix
   grows.
-- The step time follows the TTFT of recently finished prefills. When the
-  engine is idle, steps are short, so a prompt, including a short tail after
+- The step time follows the prefill work queued now and how long recent
+  prefills queued. When the engine is idle, steps are short, so a prompt, including a short tail after
   a long prefix-cache hit, is spread across the stages. As requests queue up,
   steps get longer and spend less time on per-step overhead.
 

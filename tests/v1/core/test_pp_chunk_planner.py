@@ -147,9 +147,9 @@ def test_fit_recovers_coefficients(cost: ChunkCostModel):
         fit_chunk_cost([(c, 0, t) for c, _, t in samples])
 
 
-def test_step_target_before_any_finish_treats_queue_as_batch():
-    """Before any prefill finishes, T is taken for the queued prefills served
-    as one FCFS batch: each one's TTFT is its work plus the work ahead of it."""
+def test_step_target_treats_queue_as_batch():
+    """T is taken for the queued prefills served as one FCFS batch: each
+    one's TTFT is its work plus the work ahead of it."""
     planner = make_planner(4)
     N = 64 * 1024
     queue = [_req(N), _req(N, 1024), _req(N)]
@@ -173,23 +173,24 @@ def test_step_target_before_any_finish_treats_queue_as_batch():
     assert len(consumed) == 64
 
 
-def test_step_target_from_finished_prefills():
-    """Once prefills finish, T follows their mean TTFT, scaled up by how much
-    of it was spent queued rather than computing."""
+def test_step_target_scaled_by_measured_queueing():
+    """Finished prefills that queued scale the queue's T up by the ratio of
+    their time until the last chunk left the first stage to their compute."""
     planner = make_planner(4)
-    o, S = COST.o, 4
+    o, S, N = COST.o, 4, 64 * 1024
+    queue = [_req(N)]
+    W = COST.total_work(N, 0)
     # TTFT 400 ms, of which 3 * 20 ms crossing the later stages: 340 ms until
     # the last chunk left the first stage, for 100 ms of own compute.
     for _ in range(40):
-        planner.record_first_token(400.0, 20.0, 100.0, o)
-    expected = o + math.sqrt(o * 400.0 * 3.4 / (S - 1))
-    queue = [_req(1 << 20)]
+        planner.record_first_token(400.0, 20.0, 100.0)
+    expected = o + math.sqrt(o * W * 3.4 / (S - 1))
     assert planner.step_target_time(queue, _computed) == pytest.approx(expected)
-    # Only the last 32 count, and the queue ratio never drops below 1.
+    # Only the last 32 count, and the ratio never drops below 1.
     for _ in range(32):
-        planner.record_first_token(100.0, 20.0, 100.0, o)
-    expected = o + math.sqrt(o * 100.0 / (S - 1))
-    assert planner.step_target_time(queue, _computed) == pytest.approx(expected)
+        planner.record_first_token(100.0, 20.0, 100.0)
+    lone = planner.target_time(N, 0)
+    assert planner.step_target_time(queue, _computed) == pytest.approx(lone)
 
 
 def test_step_charges_each_prefill_its_prefix_cost():

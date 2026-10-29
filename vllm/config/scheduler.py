@@ -93,9 +93,10 @@ class SchedulerConfig:
     """Size prefill chunks by a per-step time target instead of the token
     budget, for prefill under pipeline parallelism with async scheduling.
     Chunk durations are predicted by `pp_dynamic_chunk_cost`, and every step
-    is filled up to the same time, chosen from the TTFT of recently finished
-    prefills: short when the engine is idle, so that a prompt is spread over
-    the pipeline stages, and longer as requests queue up. Requires
+    is filled up to the same time, chosen from the prefills queued now and
+    how long recent ones queued: short when the engine is idle, so that a
+    prompt is spread over the pipeline stages, and longer as requests queue
+    up. Requires
     `pipeline_parallel_size > 1`, chunked prefill, the FCFS policy and the V2
     model runner; incompatible with `long_prefill_token_threshold`. Off by
     default."""

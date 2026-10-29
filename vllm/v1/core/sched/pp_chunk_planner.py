@@ -4,7 +4,7 @@
 
 Every step of prefill chunks is filled up to the same time ``T``, whichever
 requests the chunks come from, so no step holds up the pipeline. This module
-picks ``T`` from the requests that recently got their first token and
+picks ``T`` from the prefills queued now and how long recent ones queued, and
 converts it into chunk sizes using the ``pp_dynamic_chunk_cost`` model:
 
     d(c, L) = o + e * L + a * c + b * c * (L + c / 2)
@@ -29,9 +29,9 @@ if TYPE_CHECKING:
 # TRTLLM attention on B300) run 10-30% slower on chunks that are not a
 # multiple of 256, so finer alignment loses more than it gains.
 PP_CHUNK_ALIGNMENT = 512
-# Recently finished prefills that set the step time.
-_TTFT_WINDOW = 32
-# Bounds the per-step cost of scanning the queue before any prefill finishes.
+# Recently finished prefills whose queueing scales the step time.
+_QUEUEING_WINDOW = 32
+# Bounds the per-step cost of scanning the queue.
 _MAX_QUEUE_SCAN = 64
 
 
@@ -111,14 +111,12 @@ class PPChunkPlanner:
         self.gran = gran
         self.c_min = c_min
         self.c_max = c_max
-        # (TTFT, time until the last chunk left the first stage, own compute,
-        # fixed cost per chunk), in ms, of recently finished prefills.
-        self._finished: deque[tuple[float, float, float, float]] = deque(
-            maxlen=_TTFT_WINDOW
-        )
+        # (time until the last chunk left the first stage, own compute), in
+        # ms, of recently finished prefills.
+        self._finished: deque[tuple[float, float]] = deque(maxlen=_QUEUEING_WINDOW)
 
     def record_first_token(
-        self, ttft_ms: float, last_step_ms: float, work_ms: float, overhead_ms: float
+        self, ttft_ms: float, last_step_ms: float, work_ms: float
     ) -> None:
         """Record a prefill that produced its first token.
 
@@ -128,11 +126,10 @@ class PPChunkPlanner:
                 chunk spent ``(S - 1) * last_step_ms`` crossing the later
                 stages.
             work_ms: its compute from where it started, excluding overheads.
-            overhead_ms: the fixed cost each of its chunks paid.
 
         """
         queued_ms = ttft_ms - (self.pp_size - 1) * last_step_ms
-        self._finished.append((ttft_ms, queued_ms, work_ms, overhead_ms))
+        self._finished.append((queued_ms, work_ms))
 
     def target_time(self, N: int, L0: int) -> float:
         """Step time (ms) for a lone ``N``-token prompt starting at prefix ``L0``.
@@ -160,31 +157,32 @@ class PPChunkPlanner:
 
         A step's fixed cost ``o`` delays every request in the system, and
         ``(S - 1) * T`` is added to each TTFT for the last chunk to cross the
-        later stages. Balancing the two with Little's law gives
-        ``T = o + sqrt(o * R / (S - 1))`` for a mean TTFT ``R``. Faster steps
-        also shorten the queue when arrivals do not wait on service, which
-        raises the sensitivity of ``R`` to the step overhead by the ratio of a
-        request's time until its last chunk leaves the first stage to its own
-        compute, so the square root is scaled by that ratio (at least 1).
+        later stages. Balancing the two gives ``T = o + sqrt(o * R / (S - 1))``
+        for a mean TTFT ``R``, taken from the prefills queued now served as
+        one FCFS batch: each one's TTFT is its own compute plus that of the
+        prefills ahead of it, as in ``target_time``. Being the current queue,
+        it follows load changes at the next step.
 
-        ``R``, the ratio and ``o`` are averaged over recently finished
-        prefills. Before any finishes, the queued prefills stand in for them
-        as one batch: each one's TTFT is its compute plus that of the
-        prefills ahead of it, as in ``target_time``.
+        When arrivals do not wait on service, faster steps also shorten the
+        queue, which raises the sensitivity of ``R`` to the step overhead by
+        the ratio of a request's time until its last chunk leaves the first
+        stage to its own compute. That ratio (at least 1) can only be
+        measured, so it is averaged over recently finished prefills and
+        scales the square root.
 
         ``computed_tokens`` gives the prefix a request starts from, so that
         waiting requests can be credited with their expected prefix-cache hits.
         """
         if self.pp_size <= 1:
             return math.inf
+        R, o = self._queue_as_batch(queue, computed_tokens)
+        ratio = 1.0
         if self._finished:
-            n = len(self._finished)
-            ttft, queued, work, o = (sum(x) / n for x in zip(*self._finished))
-            ratio = max(1.0, queued / work) if work > 0 else 1.0
-        else:
-            ttft, o = self._queue_as_batch(queue, computed_tokens)
-            ratio = 1.0
-        return o + math.sqrt(o * ttft * ratio / (self.pp_size - 1))
+            queued = sum(q for q, _ in self._finished)
+            work = sum(w for _, w in self._finished)
+            if work > 0:
+                ratio = max(1.0, queued / work)
+        return o + math.sqrt(o * R * ratio / (self.pp_size - 1))
 
     def _queue_as_batch(
         self,

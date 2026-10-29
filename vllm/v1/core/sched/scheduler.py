@@ -1823,29 +1823,27 @@ class Scheduler(SchedulerInterface):
         return new_block_ids_to_zero or None
 
     def _pp_record_first_token(self, request: Request) -> None:
-        """Feed a prefill's TTFT to pp_dynamic_chunking. Requests whose prompt
-        was never prefilled in chunks (e.g. a full prefix-cache hit) are
-        skipped."""
+        """Feed how long a prefill queued to pp_dynamic_chunking. Requests
+        whose prompt was never prefilled in chunks (e.g. a full prefix-cache
+        hit) are skipped."""
         assert self.pp_chunk_planner is not None
         assert request.pp_chunk_arrival_s is not None
         if (
             request.pp_chunk_last_step_ms is not None
             and request.pp_chunk_work_ms is not None
-            and request.pp_chunk_overhead_ms is not None
         ):
             self.pp_chunk_planner.record_first_token(
                 ttft_ms=1000 * (time.monotonic() - request.pp_chunk_arrival_s),
                 last_step_ms=request.pp_chunk_last_step_ms,
                 work_ms=request.pp_chunk_work_ms,
-                overhead_ms=request.pp_chunk_overhead_ms,
             )
         request.pp_chunk_arrival_s = None
 
     def _pp_queue_computed_tokens(self, request: Request) -> int:
         """Prefix a queued request starts from, for the pp_dynamic_chunking
-        step time before any prefill has finished. A waiting request's local
-        prefix-cache hit is looked up once and reused while it waits; external
-        (connector) hits are unknown and not counted."""
+        step time. A waiting request's local prefix-cache hit is looked up
+        once and reused while it waits; external (connector) hits are unknown
+        and not counted."""
         if request.num_computed_tokens > 0:
             return request.num_computed_tokens
         if request.pp_chunk_est_cached_tokens is None:

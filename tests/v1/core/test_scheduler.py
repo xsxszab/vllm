@@ -9035,9 +9035,8 @@ def test_pp_dynamic_chunking_step_target_grows_with_queue(monkeypatch):
 
 
 def test_pp_dynamic_chunking_records_first_token(monkeypatch):
-    """A prefill's first token feeds its TTFT, the part of it spent before
-    its last chunk left the first stage, and its own work into the step
-    time."""
+    """A prefill's first token feeds the time it spent before its last chunk
+    left the first stage, and its own work, into later step times."""
     scheduler, planner = _pp_chunk_scheduler(monkeypatch)
     N = PP_CHUNK_C_MIN
     (req,) = create_requests(num_requests=1, num_tokens=N, max_tokens=4)
@@ -9060,14 +9059,15 @@ def test_pp_dynamic_chunking_records_first_token(monkeypatch):
         ),
     )
     assert req.pp_chunk_arrival_s is None
-    ((ttft, queued, work, overhead),) = planner._finished
-    assert ttft == pytest.approx(2000, abs=100)
-    assert queued == pytest.approx(ttft - 3 * last_step_ms)
+    ((queued, work),) = planner._finished
+    assert queued == pytest.approx(2000 - 3 * last_step_ms, abs=100)
     assert work == pytest.approx(planner.cost.total_work(N, 0))
-    assert overhead == planner.cost.o
+    # The next prefill's step time is scaled by how long this one queued.
+    (nxt,) = create_requests(num_requests=1, num_tokens=8192, req_ids=["next"])
     o = planner.cost.o
-    expected = o + math.sqrt(o * ttft * (queued / work) / 3)
-    assert planner.step_target_time([], lambda r: 0) == pytest.approx(expected)
+    W = planner.cost.total_work(8192, 0)
+    expected = o + math.sqrt(o * W * (queued / work) / 3)
+    assert planner.step_target_time([nxt], lambda r: 0) == pytest.approx(expected)
 
 
 def test_pp_dynamic_chunking_spec_decode_padding(monkeypatch):
