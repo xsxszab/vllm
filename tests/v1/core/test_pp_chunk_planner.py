@@ -21,10 +21,11 @@ COST = ChunkCostModel(o=2.0, a=0.03, b=1.3e-6)
 GRAN = 64
 C_MIN = 512
 C_MAX = 32768
+BACKLOG = 2048
 
 
 def make_planner(pp_size: int, c_max: int = C_MAX) -> PPChunkPlanner:
-    return PPChunkPlanner(COST, pp_size, GRAN, C_MIN, c_max)
+    return PPChunkPlanner(COST, pp_size, GRAN, C_MIN, c_max, BACKLOG)
 
 
 def predict(c: int, L: int) -> float:
@@ -101,6 +102,9 @@ def test_max_chunk_boundaries():
     # Capped at c_max and at the remaining prompt.
     assert planner.max_chunk(1e9, 0, 1 << 20) == C_MAX
     assert planner.max_chunk(1e9, 0, 777) == 777
+    # A budget of exactly an aligned chunk's work yields that chunk.
+    for L in range(0, 131072, 977):
+        assert planner.max_chunk(COST.work(2048, L), L, 1 << 20) == 2048
 
 
 def test_target_time_bounds():
@@ -146,16 +150,18 @@ def test_queue_target_uses_mean_cumulative_work():
     queue = [_req(N), _req(N, 1024), _req(N)]
     cum = np.cumsum([COST.total_work(N, r.num_computed_tokens) for r in queue])
     expected = COST.o + math.sqrt(cum.mean() * COST.o / 3)
-    assert planner.queue_target_time(queue, _computed) == pytest.approx(expected)
+    assert planner.queue_target_time(queue, _computed) == (pytest.approx(expected), 3)
     # A lone prefill keeps its own target; one token left is a decode.
-    assert planner.queue_target_time([_req(N)], _computed) == 0
-    assert planner.queue_target_time([_req(N), _req(N, N - 1)], _computed) == 0
+    assert planner.queue_target_time([_req(N)], _computed) == (0, 1)
+    assert planner.queue_target_time([_req(N), _req(N, N - 1)], _computed) == (0, 1)
 
 
 def test_queue_target_grows_with_backlog_and_bounds_scan():
     N = 32 * 1024
     planner = make_planner(4, c_max=4096)
-    targets = [planner.queue_target_time([_req(N)] * k, _computed) for k in (2, 4, 8)]
+    targets = [
+        planner.queue_target_time([_req(N)] * k, _computed)[0] for k in (2, 4, 8)
+    ]
     assert targets == sorted(targets)
 
     def endless(counter):
@@ -165,13 +171,25 @@ def test_queue_target_grows_with_backlog_and_bounds_scan():
 
     # Stops once the head's chunk alone fills the token budget.
     consumed: list[None] = []
-    T = planner.queue_target_time(endless(consumed), _computed)
+    T, _ = planner.queue_target_time(endless(consumed), _computed)
     assert T - COST.o >= COST.work(4096, 0)
     assert len(consumed) < 64
     # Otherwise the scan is bounded.
     consumed = []
     make_planner(4).queue_target_time(endless(consumed), _computed)
     assert len(consumed) == 64
+
+
+def test_backlog_target_time():
+    """A backlog floors steps at a BACKLOG-token chunk, costed at prefix 0 up
+    to pp_size prefills and at the scheduled prefix beyond."""
+    planner = make_planner(4)
+    L = 65536
+    assert planner.backlog_target_time(1, L) == 0
+    assert planner.backlog_target_time(4, L) == pytest.approx(predict(BACKLOG, 0))
+    assert planner.backlog_target_time(5, L) == pytest.approx(predict(BACKLOG, L))
+    small = make_planner(4, c_max=1024)
+    assert small.backlog_target_time(2, 0) == pytest.approx(predict(1024, 0))
 
 
 def test_step_caps_resumed_output_tokens():

@@ -164,6 +164,7 @@ class Scheduler(SchedulerInterface):
                     self.max_num_scheduled_tokens,
                 ),
                 c_max=self.max_num_scheduled_tokens,
+                backlog_tokens=self.scheduler_config.pp_dynamic_chunk_backlog_tokens,
             )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
@@ -752,12 +753,14 @@ class Scheduler(SchedulerInterface):
         # Equal-time prefill chunking (pp_dynamic_chunking).
         pp_step = None
         if self.pp_chunk_planner is not None:
-            pp_step = PPChunkStep(
-                self.pp_chunk_planner,
+            queue_target_ms, num_queued_prefills = (
                 self.pp_chunk_planner.queue_target_time(
                     itertools.chain(self.running, self.waiting),
                     self._pp_queue_computed_tokens,
-                ),
+                )
+            )
+            pp_step = PPChunkStep(
+                self.pp_chunk_planner, queue_target_ms, num_queued_prefills
             )
 
         # For logging.

@@ -123,6 +123,36 @@ llm = LLM(
 )
 ```
 
+#### Dynamic Prefill Chunking
+
+With pipeline parallelism, a long prompt's chunks flow through the stages one
+after another, so its TTFT depends on how the prompt is chunked: small chunks
+fill the pipeline sooner, large chunks spend less on per-step overhead.
+`--pp-dynamic-chunking` (off by default) sizes each prefill chunk by time
+instead of a fixed token budget. It requires the V2 model runner, async
+scheduling (on by default) and the FCFS policy.
+
+- A lone prompt is split into chunks that each take the same time, chosen to
+  minimize its TTFT; later chunks get fewer tokens as attention over the
+  prefix grows. A short tail after a long prefix-cache hit is split too, so
+  it is spread across the stages.
+- With two or more prefills queued, steps grow with the backlog to cut the
+  mean TTFT of the queue, and are at least as long as a chunk of
+  `--pp-dynamic-chunk-backlog-tokens` (default 2048) tokens, which favors
+  throughput under sustained load.
+
+The chunk cost is profiled on every stage at startup and logged; pass the
+logged JSON as `--pp-dynamic-chunk-cost` to skip profiling.
+`--max-num-batched-tokens` caps the chunk size, so raise it (e.g. to 16384)
+to let lone long prompts use large chunks.
+
+```bash
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+    --pipeline-parallel-size 4 \
+    --max-num-batched-tokens 16384 \
+    --pp-dynamic-chunking
+```
+
 ### Expert Parallelism (EP)
 
 Expert parallelism is a specialized form of parallelism for Mixture of Experts (MoE) models, where different expert networks are distributed across GPUs.

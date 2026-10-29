@@ -8980,9 +8980,9 @@ def test_pp_dynamic_chunking_queue_target_credits_waiting_prefix_hit(monkeypatch
     monkeypatch.setattr(kv_cache_manager, "peek_num_cached_tokens", counting_peek)
     queue = list(scheduler.waiting)
     for _ in range(2):
-        T = planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
-    assert pytest.approx(planner.queue_target_time(queue, lambda r: hit)) == T
-    assert planner.queue_target_time(queue, lambda r: 0) > T
+        T, _ = planner.queue_target_time(queue, scheduler._pp_queue_computed_tokens)
+    assert pytest.approx(planner.queue_target_time(queue, lambda r: hit)[0]) == T
+    assert planner.queue_target_time(queue, lambda r: 0)[0] > T
     assert lookups == ["b", "c"]
 
 
@@ -9018,10 +9018,11 @@ def test_pp_dynamic_chunking_packs_next_request_into_last_chunk(
         if _scheduled_so_far(steps, "a") == N_a - last_a:
             scheduler.add_request(req_b)
             # The backlog is too small to raise the step target above A's.
-            queue_ms = planner.queue_target_time(
+            queue_ms, _ = planner.queue_target_time(
                 [req_a, req_b], lambda r: r.num_computed_tokens
             )
             assert 0 < queue_ms < req_a.pp_chunk_target_ms
+            assert planner.backlog_target_time(2, 0) < req_a.pp_chunk_target_ms
 
     steps = _drive_pp_prefill(
         scheduler, lambda steps: "b" in steps[-1], add_b_before_last_chunk
@@ -9051,7 +9052,7 @@ def test_pp_dynamic_chunking_backlog_raises_step_target(monkeypatch):
         reqs = create_requests(num_requests=num_reqs, num_tokens=N, max_tokens=1)
         for req in reqs:
             scheduler.add_request(req)
-        queue_ms = planner.queue_target_time(reqs, lambda r: r.num_computed_tokens)
+        queue_ms, _ = planner.queue_target_time(reqs, lambda r: r.num_computed_tokens)
         output = scheduler.schedule()
         assert list(output.num_scheduled_tokens) == [reqs[0].request_id]
         first = output.num_scheduled_tokens[reqs[0].request_id]
@@ -9065,6 +9066,28 @@ def test_pp_dynamic_chunking_backlog_raises_step_target(monkeypatch):
         first_chunks.append(first)
     assert first_chunks[0] < first_chunks[1] < first_chunks[2]
     assert first_chunks[3] == 8192
+
+
+def test_pp_dynamic_chunking_backlog_floors_short_prompts(monkeypatch):
+    """Short prompts alone get small chunks, but with others queued each step
+    grows to at least a backlog_tokens chunk, above the queue target."""
+    N = 8192
+    for num_reqs in (1, 2, 6):
+        scheduler, planner = _pp_chunk_scheduler(
+            monkeypatch, max_num_batched_tokens=8192
+        )
+        reqs = create_requests(num_requests=num_reqs, num_tokens=N, max_tokens=1)
+        for req in reqs:
+            scheduler.add_request(req)
+        queue_ms, _ = planner.queue_target_time(reqs, lambda r: r.num_computed_tokens)
+        output = scheduler.schedule()
+        head = reqs[0].request_id
+        assert list(output.num_scheduled_tokens) == [head]
+        if num_reqs == 1:
+            assert output.num_scheduled_tokens[head] == PP_CHUNK_C_MIN
+        else:
+            assert queue_ms < planner.backlog_target_time(num_reqs, 0)
+            assert output.num_scheduled_tokens[head] == planner.backlog_tokens
 
 
 def test_pp_dynamic_chunking_spec_decode_padding(monkeypatch):

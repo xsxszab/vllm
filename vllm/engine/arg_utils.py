@@ -621,6 +621,9 @@ class EngineArgs:
     )
     pp_dynamic_chunking: bool = SchedulerConfig.pp_dynamic_chunking
     pp_dynamic_chunk_min_tokens: int = SchedulerConfig.pp_dynamic_chunk_min_tokens
+    pp_dynamic_chunk_backlog_tokens: int = (
+        SchedulerConfig.pp_dynamic_chunk_backlog_tokens
+    )
     pp_dynamic_chunk_cost: str | None = SchedulerConfig.pp_dynamic_chunk_cost
     max_num_seqs: int | None = None
     max_num_active_seqs: int | None = SchedulerConfig.max_num_active_seqs
@@ -1792,6 +1795,10 @@ class EngineArgs:
             **scheduler_kwargs["pp_dynamic_chunk_min_tokens"],
         )
         scheduler_group.add_argument(
+            "--pp-dynamic-chunk-backlog-tokens",
+            **scheduler_kwargs["pp_dynamic_chunk_backlog_tokens"],
+        )
+        scheduler_group.add_argument(
             "--pp-dynamic-chunk-cost", **scheduler_kwargs["pp_dynamic_chunk_cost"]
         )
         # multi-step scheduling has been removed; corresponding arguments
@@ -2695,6 +2702,7 @@ class EngineArgs:
             ),
             pp_dynamic_chunking=self.pp_dynamic_chunking,
             pp_dynamic_chunk_min_tokens=self.pp_dynamic_chunk_min_tokens,
+            pp_dynamic_chunk_backlog_tokens=self.pp_dynamic_chunk_backlog_tokens,
             pp_dynamic_chunk_cost=self.pp_dynamic_chunk_cost,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,

@@ -5,8 +5,9 @@
 A prompt split into chunks of durations ``d_1..d_K`` flows through ``S``
 pipeline stages as a proportionate flow shop, so its TTFT is
 ``sum(d_k) + (S - 1) * max(d_k)``. The scheduler therefore sizes every chunk
-to the same target duration ``T``, and this module picks ``T`` and converts
-it into token counts using the ``pp_dynamic_chunk_cost`` model:
+to the same target duration ``T``, and this module picks ``T`` (raised under
+a backlog of prefills, for throughput) and converts it into token counts
+using the ``pp_dynamic_chunk_cost`` model:
 
     d(c, L) = o + a * c + b * c * (L + c / 2)
 
@@ -79,6 +80,8 @@ class PPChunkPlanner:
         c_min: smallest chunk worth scheduling; keeps GEMMs out of the
             bandwidth-bound regime.
         c_max: largest chunk (the scheduler's token budget).
+        backlog_tokens: with a backlog of prefills, steps take at least as
+            long as a chunk of this many tokens.
 
     """
 
@@ -89,13 +92,15 @@ class PPChunkPlanner:
         gran: int,
         c_min: int,
         c_max: int,
+        backlog_tokens: int,
     ) -> None:
-        assert gran >= 1 and c_min >= 1 and c_max >= 1
+        assert gran >= 1 and c_min >= 1 and c_max >= 1 and backlog_tokens >= 1
         self.cost = cost
         self.pp_size = pp_size
         self.gran = gran
         self.c_min = c_min
         self.c_max = c_max
+        self.backlog_tokens = backlog_tokens
 
     def target_time(self, N: int, L0: int) -> float:
         """Target duration ``T`` (ms) of every chunk of an ``N``-token prompt.
@@ -139,7 +144,9 @@ class PPChunkPlanner:
             return limit
         if c >= limit:
             return limit
-        aligned = int(c) // self.gran * self.gran
+        # The slack keeps a budget of exactly an aligned chunk's work from
+        # rounding down a whole granule on float error.
+        aligned = int(c + 1e-6) // self.gran * self.gran
         if aligned == 0 and remaining <= self.gran:
             return remaining
         return aligned
@@ -148,7 +155,7 @@ class PPChunkPlanner:
         self,
         queue: Iterable["Request"],
         computed_tokens: Callable[["Request"], int],
-    ) -> float:
+    ) -> tuple[float, int]:
         """Step target (ms) minimizing the mean TTFT of the queued prefills.
 
         Under FCFS with equal-time steps, the ``j``-th queued prefill gets its
@@ -161,11 +168,15 @@ class PPChunkPlanner:
         ``computed_tokens`` gives the prefix each request starts from, so that
         waiting requests can be credited with their expected prefix-cache
         hits. The scan stops once the head request's chunk alone would fill
-        the token budget. Returns 0 with fewer than two queued prefills,
-        leaving a lone request at its own target.
+        the token budget.
+
+        Returns:
+            The target, 0 with fewer than two queued prefills (leaving a lone
+            request at its own target), and the number of prefills scanned.
+
         """
         if self.pp_size <= 1:
-            return 0.0
+            return 0.0, 0
         cost = self.cost
         num_reqs = 0
         cum_work = 0.0
@@ -188,23 +199,47 @@ class PPChunkPlanner:
             ):
                 break
         if num_reqs < 2:
+            return 0.0, num_reqs
+        mean_work = sum_cum_work / num_reqs
+        return cost.o + math.sqrt(mean_work * cost.o / (self.pp_size - 1)), num_reqs
+
+    def backlog_target_time(self, num_prefills: int, L: int) -> float:
+        """Lower bound (ms) on the step target with ``num_prefills`` queued.
+
+        The queue target assumes no further arrivals; under sustained load,
+        the throughput lost to small chunks delays every later request too,
+        so each step is at least as long as a ``backlog_tokens`` chunk. With
+        up to ``pp_size`` prefills, that chunk is costed at prefix 0, so that
+        short tails after long cached prefixes still get split across the
+        stages; with more, distinct requests keep every stage busy and the
+        chunk is costed at the prefix ``L`` of the scheduled request.
+        """
+        if num_prefills < 2:
             return 0.0
-        return cost.o + math.sqrt(sum_cum_work / num_reqs * cost.o / (self.pp_size - 1))
+        c = min(self.backlog_tokens, self.c_max)
+        return self.cost.o + self.cost.work(c, L if num_prefills > self.pp_size else 0)
 
 
 class PPChunkStep:
     """Caps the prefill chunks of one scheduling step to a shared target.
 
     The first prefill chunk scheduled in a step sets the step's time target:
-    the larger of its request's own ``T`` and ``queue_target_ms``. Later
-    requests only get what is left of it, so a chunk that finishes one
+    the largest of its request's own ``T``, ``queue_target_ms`` and the
+    planner's backlog target for ``num_queued_prefills``.
+    Later requests only get what is left of it, so a chunk that finishes one
     request can be padded with the start of the next without the step
     running longer than the target.
     """
 
-    def __init__(self, planner: PPChunkPlanner, queue_target_ms: float = 0.0) -> None:
+    def __init__(
+        self,
+        planner: PPChunkPlanner,
+        queue_target_ms: float = 0.0,
+        num_queued_prefills: int = 0,
+    ) -> None:
         self.planner = planner
         self.queue_target_ms = queue_target_ms
+        self.num_queued_prefills = num_queued_prefills
         self.target_ms: float | None = None
         self.work_used = 0.0
 
@@ -213,6 +248,15 @@ class PPChunkStep:
         if T is None:
             T = self.planner.target_time(request.num_tokens, num_computed_tokens)
         return T
+
+    def _step_target(self, request: "Request", num_computed_tokens: int) -> float:
+        return max(
+            self._request_target(request, num_computed_tokens),
+            self.queue_target_ms,
+            self.planner.backlog_target_time(
+                self.num_queued_prefills, num_computed_tokens
+            ),
+        )
 
     def cap(
         self, request: "Request", num_computed_tokens: int, num_new_tokens: int
@@ -227,10 +271,7 @@ class PPChunkStep:
         planner = self.planner
         target_ms = self.target_ms
         if target_ms is None:
-            target_ms = max(
-                self._request_target(request, num_computed_tokens),
-                self.queue_target_ms,
-            )
+            target_ms = self._step_target(request, num_computed_tokens)
         budget = target_ms - planner.cost.o - self.work_used
         remaining = request.num_tokens - num_computed_tokens
         cap = planner.max_chunk(budget, num_computed_tokens, remaining)
@@ -249,12 +290,13 @@ class PPChunkStep:
         self.work_used += self.planner.cost.work(num_new_tokens, num_computed_tokens)
         if not _is_prefill(request, num_computed_tokens):
             return
-        T = self._request_target(request, num_computed_tokens)
         if self.target_ms is None:
-            self.target_ms = max(T, self.queue_target_ms)
+            self.target_ms = self._step_target(request, num_computed_tokens)
         if request.pp_chunk_target_ms is None:
             # First chunk: pin the target computed from this prefix length.
-            request.pp_chunk_target_ms = T
+            request.pp_chunk_target_ms = self._request_target(
+                request, num_computed_tokens
+            )
 
 
 def _is_prefill(request: "Request", num_computed_tokens: int) -> bool:
