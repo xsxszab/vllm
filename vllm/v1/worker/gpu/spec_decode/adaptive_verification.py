@@ -30,6 +30,7 @@ _PROFILE_REPLAYS = 5
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.pp_utils import PPHandler
     from vllm.v1.worker.gpu.states import RequestState
     from vllm.v1.worker.utils import AttentionGroup
 
@@ -225,9 +226,6 @@ class AdmittedDraftCounts:
 
 
 class AdaptiveVerificationManager:
-    # PP: steps between a step's confidences reaching the budget, 0 without PP.
-    _pp_lag: int = 0
-
     def __init__(
         self,
         req_states: "RequestState",
@@ -295,10 +293,10 @@ class AdaptiveVerificationManager:
 
         # PP: the last rank prepares a step long after the first, so ranks
         # cannot share one freshest snapshot. Instead every rank folds in a
-        # step's confidences pp_lag steps later (apply_pp_confidences), takes
-        # one host snapshot per step (snapshot_pp_confidences), and budgets
-        # from the snapshot taken pp_lag steps earlier. All three are tied to
-        # the step count, so every rank picks the same budget and allocation.
+        # step's confidences pp_lag steps later and takes one host snapshot per
+        # step (advance_pp_step), and budgets from the snapshot taken pp_lag
+        # steps earlier. All three are tied to the step count, so every rank
+        # picks the same budget and allocation. pp_lag is 0 without PP.
         self._pp_lag = pp_lag
         if pp_lag:
             self._confidence_probs.fill_(1.0)
@@ -322,21 +320,21 @@ class AdaptiveVerificationManager:
                 (max_num_reqs, self.num_speculative_steps), dtype=np.float32
             )
 
-    def apply_pp_confidences(
-        self, confidences: torch.Tensor, rows: np.ndarray, req_idx: np.ndarray
-    ) -> None:
-        """PP: fold in the confidences the last rank drafted pp_lag steps ago."""
-        device = self.req_states.device
-        if len(rows) != confidences.shape[0]:
-            confidences = confidences[
-                async_tensor_h2d(rows, device=device, dtype=torch.int64)
-            ]
-        idx = async_tensor_h2d(req_idx, device=device, dtype=torch.int64)
-        self._confidence_probs[idx] = confidences
+    def advance_pp_step(self, pp_handler: "PPHandler") -> None:
+        """PP: on every rank, once per step after its requests are added, fold
+        in the confidences drafted pp_lag steps ago and start this step's host
+        snapshot of them."""
+        popped = pp_handler.pop_confidences()
+        if popped is not None:
+            confidences, rows, req_idx = popped
+            device = self.req_states.device
+            if len(rows) != confidences.shape[0]:
+                confidences = confidences[
+                    async_tensor_h2d(rows, device=device, dtype=torch.int64)
+                ]
+            idx = async_tensor_h2d(req_idx, device=device, dtype=torch.int64)
+            self._confidence_probs[idx] = confidences
 
-    def snapshot_pp_confidences(self) -> None:
-        """PP: start this step's host copy of the confidences, after the step's
-        apply_pp_confidences and add_request calls."""
         slot_idx = self._pp_step % len(self._pp_snapshots)
         slot = self._pp_snapshots[slot_idx]
         event = self._pp_snapshot_events[slot_idx]
@@ -470,6 +468,10 @@ class AdaptiveVerificationManager:
     ) -> None:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
+        if self._pp_lag:
+            # Under PP they reach every rank, this one included, through the
+            # draft broadcast and advance_pp_step.
+            return
         num_reqs = input_batch.num_reqs
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():

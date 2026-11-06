@@ -30,6 +30,7 @@ def make_manager(
     manager.num_speculative_steps = num_steps
     manager._stale_confidences = [SimpleNamespace(np=confidences)]  # type: ignore[list-item]  # CPU-only confidence buffer.
     manager._stale_idx = 0
+    manager._pp_lag = 0
     manager.req_states = SimpleNamespace(
         req_id_to_index={"low": 0, "high": 1},
         num_computed_tokens_np=np.ones(num_reqs, dtype=np.int32),
@@ -279,13 +280,12 @@ def test_pp_ranks_budget_from_identical_confidences(monkeypatch):
 
     for step in range(12):
         for manager, handler in ((first, first_handler), (last, last_handler)):
-            popped = handler.pop_confidences()
-            if popped is not None:
-                manager.apply_pp_confidences(*popped)
+            # As in the runner: requests are freed and added before the step
+            # advances.
             if step == 5:
                 handler.on_req_idx_freed(1)
                 manager.add_request(1)
-            manager.snapshot_pp_confidences()
+            manager.advance_pp_step(handler)
 
         assert torch.equal(first._confidence_probs, last._confidence_probs)
         budget_view = first._stale_confidences_np()
@@ -294,8 +294,8 @@ def test_pp_ranks_budget_from_identical_confidences(monkeypatch):
         assert first._confidence_probs[0, 0].item() == pytest.approx(expected_slot0)
         expected_budget = (step - 2 * lag) / 100 if step >= 2 * lag else 1.0
         assert budget_view[0, 0] == pytest.approx(expected_budget)
-        if step == 6:
-            # Drafted for the freed request at step 4.
+        if step in (5, 6):
+            # Drafted for the freed request at steps 3 and 4.
             assert first._confidence_probs[1, 0].item() == 1.0
 
         speculator_buffer.fill_(step / 100)

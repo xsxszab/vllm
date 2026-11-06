@@ -243,7 +243,6 @@ class PPHandler:
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
             return False
-        recv_confidences = recv_drafts and recv_confidences
 
         # Snapshot the per-slot generation counter so a later free of any of
         # these RequestStates request indices is detectable at consume time.
