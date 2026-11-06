@@ -11,7 +11,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -225,6 +225,9 @@ class AdmittedDraftCounts:
 
 
 class AdaptiveVerificationManager:
+    # PP: steps between a step's confidences reaching the budget, 0 without PP.
+    _pp_lag: int = 0
+
     def __init__(
         self,
         req_states: "RequestState",
@@ -232,6 +235,7 @@ class AdaptiveVerificationManager:
         num_bonus_tokens: int,
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
+        pp_lag: int = 0,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -289,6 +293,77 @@ class AdaptiveVerificationManager:
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
 
+        # PP: the last rank prepares a step long after the first, so ranks
+        # cannot share one freshest snapshot. Instead every rank folds in a
+        # step's confidences pp_lag steps later (apply_pp_confidences), takes
+        # one host snapshot per step (snapshot_pp_confidences), and budgets
+        # from the snapshot taken pp_lag steps earlier. All three are tied to
+        # the step count, so every rank picks the same budget and allocation.
+        self._pp_lag = pp_lag
+        if pp_lag:
+            self._confidence_probs.fill_(1.0)
+            # The snapshot read at step s was taken at s - pp_lag; two spare
+            # slots keep an in-flight copy from being overwritten.
+            self._pp_snapshots = [
+                CpuGpuBuffer(
+                    max_num_reqs,
+                    self.num_speculative_steps,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                for _ in range(pp_lag + 2)
+            ]
+            self._pp_snapshot_events = [
+                torch.cuda.Event(blocking=True) for _ in self._pp_snapshots
+            ]
+            self._pp_snapshot_steps = [-1] * len(self._pp_snapshots)
+            self._pp_step = 0
+            self._pp_ones = np.ones(
+                (max_num_reqs, self.num_speculative_steps), dtype=np.float32
+            )
+
+    def apply_pp_confidences(
+        self, confidences: torch.Tensor, rows: np.ndarray, req_idx: np.ndarray
+    ) -> None:
+        """PP: fold in the confidences the last rank drafted pp_lag steps ago."""
+        device = self.req_states.device
+        if len(rows) != confidences.shape[0]:
+            confidences = confidences[
+                async_tensor_h2d(rows, device=device, dtype=torch.int64)
+            ]
+        idx = async_tensor_h2d(req_idx, device=device, dtype=torch.int64)
+        self._confidence_probs[idx] = confidences
+
+    def snapshot_pp_confidences(self) -> None:
+        """PP: start this step's host copy of the confidences, after the step's
+        apply_pp_confidences and add_request calls."""
+        slot_idx = self._pp_step % len(self._pp_snapshots)
+        slot = self._pp_snapshots[slot_idx]
+        event = self._pp_snapshot_events[slot_idx]
+        current_stream = torch.cuda.current_stream(self.req_states.device)
+        # The slot's previous copy may still be reading its device buffer.
+        current_stream.wait_event(event)
+        slot.gpu.copy_(self._confidence_probs)
+        self._copy_stream.wait_stream(current_stream)
+        with stream(self._copy_stream, current_stream):
+            slot.copy_to_cpu()
+            event.record()
+        self._pp_snapshot_steps[slot_idx] = self._pp_step
+        self._pp_step += 1
+
+    def _stale_confidences_np(self) -> np.ndarray:
+        if not self._pp_lag:
+            return self._stale_confidences[self._stale_idx].np
+        # This step's snapshot is self._pp_step - 1.
+        step = self._pp_step - 1 - self._pp_lag
+        if step < 0:
+            return self._pp_ones
+        slot_idx = step % len(self._pp_snapshots)
+        assert self._pp_snapshot_steps[slot_idx] == step
+        with gpu_sync_allowed():
+            self._pp_snapshot_events[slot_idx].synchronize()
+        return self._pp_snapshots[slot_idx].np
+
     def warmup_budget_kernel(self) -> None:
         """JIT the draft-budget kernel so the first binding step doesn't compile."""
         capacities = self._batch_draft_capacity[:1].fill_(self.num_speculative_steps)
@@ -298,9 +373,12 @@ class AdaptiveVerificationManager:
         )
 
     def add_request(self, req_idx: int) -> None:
+        self._confidence_probs[req_idx].fill_(1.0)
+        if self._pp_lag:
+            # This step's snapshot, taken after add_requests, copies the reset.
+            return
         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
         self._pending_resets.append(req_idx)
-        self._confidence_probs[req_idx].fill_(1.0)
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
@@ -352,22 +430,39 @@ class AdaptiveVerificationManager:
         draft_curve: list[tuple[int, float]],
         verify_curve: list[tuple[int, float]],
     ) -> None:
-        draft_curve, verify_curve = get_tp_group().broadcast_object(
-            (draft_curve, verify_curve), src=0
-        )
-        if not draft_curve or not verify_curve:
+        curves = get_tp_group().broadcast_object((draft_curve, verify_curve), src=0)
+        pp_group = get_pp_group()
+        # Each PP stage times only its own forward (and the last its drafter).
+        stage_curves = [curves] * pp_group.world_size
+        if pp_group.world_size > 1:
+            torch.distributed.all_gather_object(
+                stage_curves, curves, group=pp_group.cpu_group
+            )
+        if any(not draft or not verify for draft, verify in stage_curves):
             raise RuntimeError(
                 "Adaptive verification could not profile step costs. Pass "
                 "`enable_adaptive_verification=false` in the speculative config to "
                 "verify a fixed number of drafts instead."
             )
-        self.cost_tables = build_cost_tables_from_curves(
-            draft_curve,
-            verify_curve,
-            self.req_states.max_num_reqs,
-            self.req_states.max_num_batched_tokens,
-            self._cudagraph_limit,
-        )
+        tables = [
+            build_cost_tables_from_curves(
+                draft,
+                verify,
+                self.req_states.max_num_reqs,
+                self.req_states.max_num_batched_tokens,
+                self._cudagraph_limit,
+            )
+            for draft, verify in stage_curves
+        ]
+        if len(tables) == 1:
+            self.cost_tables = tables[0]
+        else:
+            # Microbatches keep every stage busy, so a step costs as much as its
+            # slowest stage: get_num_tokens takes the max over these rows.
+            self.cost_tables = (
+                np.stack([draft for draft, _ in tables]),
+                np.stack([verify for _, verify in tables]),
+            )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
 
     def record_confidences(
@@ -423,7 +518,7 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=num_reqs,
         )
-        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
+        stale_confidences = self._stale_confidences_np()[slots]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]
@@ -442,13 +537,17 @@ class AdaptiveVerificationManager:
         num_tokens_to_estimated_accepted_tokens = np.concatenate(
             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
         )
-        costs = (
-            draft_cost_ms[len(req_ids)]
-            + verify_cost_ms[
+        # One row per PP stage (a single row without PP); the slowest stage
+        # sets the step cost.
+        costs = np.max(
+            np.atleast_2d(draft_cost_ms)[:, len(req_ids), None]
+            + np.atleast_2d(verify_cost_ms)[
+                :,
                 num_non_draft_tokens_total : num_non_draft_tokens_total
                 + max_draft_budget
-                + 1
-            ]
+                + 1,
+            ],
+            axis=0,
         )
         num_drafts_per_req = {
             req_id: int(num_drafts)
@@ -594,6 +693,7 @@ def maybe_create_adaptive_verification_manager(
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     copy_admitted_drafts_to_host: bool = False,
+    pp_lag: int = 0,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -643,4 +743,5 @@ def maybe_create_adaptive_verification_manager(
         num_bonus_tokens,
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
+        pp_lag=pp_lag,
     )

@@ -311,6 +311,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.use_aux_hidden_state_outputs = (
                 self.speculative_config.uses_aux_hidden_states
             )
+        # Every PP rank trims the verified drafts, but only the last one has the
+        # speculator that decides whether adaptive verification is on.
+        self.adaptive_verification_enabled: bool = getattr(
+            self.speculator, "enable_adaptive_verification", False
+        )
+        if self.use_pp and self.speculative_config is not None:
+            pp_group = get_pp_group()
+            self.adaptive_verification_enabled = pp_group.broadcast_object(
+                self.adaptive_verification_enabled, src=pp_group.world_size - 1
+            )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -735,9 +745,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # The speculator clears the flag at load time when the checkpoint has
         # no confidence head, so it holds the effective value.
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
-            enable_adaptive_verification=getattr(
-                self.speculator, "enable_adaptive_verification", False
-            ),
+            enable_adaptive_verification=self.adaptive_verification_enabled,
             attn_groups=self.attn_groups,
             req_states=self.req_states,
             query_start_loc=self.input_buffers.query_start_loc,
@@ -747,7 +755,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
+            pp_lag=self.pp_handler.ring_depth if self.pp_handler is not None else 0,
         )
+        if self.adaptive_verification is not None and self.pp_handler is not None:
+            self.pp_handler.enable_confidence_relay()
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -981,6 +992,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
+            # Adaptive verification profiles every stage; these have no drafter.
+            self.step_timing.forward_end()
+            self.step_timing.drafter_start()
+            self.step_timing.drafter_end()
             return None, None
 
         assert self.execute_model_state is not None
@@ -1277,6 +1292,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
                 self.postprocess_sampled(**outputs)
+            if self.adaptive_verification is not None:
+                # Every rank, the last included, folds in the confidences
+                # drafted pp_size steps ago.
+                confidences = self.pp_handler.pop_confidences()
+                if confidences is not None:
+                    self.adaptive_verification.apply_pp_confidences(*confidences)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -1840,6 +1861,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            if self.adaptive_verification is not None and self.use_pp:
+                self.adaptive_verification.snapshot_pp_confidences()
             if self.encoder_cache is not None:
                 # add_requests initializes RoPE positions from CPU metadata first.
                 for req_id, updates in scheduler_output.encoder_input_updates.items():
@@ -2239,7 +2262,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch = self.pcp_manager.global_batch
             assert self.pp_handler is not None
             all_decode_next = self.pp_handler.receive(
-                input_batch, recv_drafts=num_spec_tokens > 0
+                input_batch,
+                recv_drafts=num_spec_tokens > 0,
+                recv_confidences=self.adaptive_verification is not None,
             )
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
@@ -2390,7 +2415,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if self.adaptive_verification is not None:
+            # Under PP, broadcast_drafts carries the confidences to every rank.
+            if self.adaptive_verification is not None and not self.use_pp:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
@@ -2404,7 +2430,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             # Drafts aren't used when none were proposed this step (e.g. skip_drafts).
             if self.pp_handler is not None and num_spec_tokens > 0:
-                self.pp_handler.broadcast_drafts(draft_tokens)
+                confidences = None
+                if self.adaptive_verification is not None:
+                    assert self.speculator is not None
+                    confidences = self.speculator.draft_token_confidence_probs
+                self.pp_handler.broadcast_drafts(draft_tokens, input_batch, confidences)
 
         if defer_kv_finalize:
             self.kv_connector.finalize_step()

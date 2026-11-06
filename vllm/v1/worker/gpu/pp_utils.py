@@ -35,6 +35,17 @@ class PendingRecv:
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
 
 
+@dataclass
+class PendingConfidences:
+    """One step's draft confidences, applied ring_depth steps later on every rank."""
+
+    # Broadcast receive event on non-last ranks; None on the last rank.
+    event: torch.cuda.Event | None
+    confidences: torch.Tensor  # [num_reqs, num_speculative_steps], float32
+    idx_mapping_np: np.ndarray  # [num_reqs]
+    gen_np: np.ndarray  # [num_reqs]
+
+
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
     with outputs that might be needed in a subsequent (decode) step.
@@ -81,9 +92,14 @@ class PPHandler:
         ring_depth = get_pp_group().world_size
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             ring_depth = 1
+        self.ring_depth = ring_depth
         self.queue: deque[PendingRecv | None] = (
             deque() if self.is_last_rank else deque([None] * ring_depth)
         )
+        # Adaptive verification: the same FIFO for draft confidences, but kept on
+        # every rank, the last included, so that all ranks fold in a step's
+        # confidences at the same later step. See `pop_confidences`.
+        self.confidence_queue: deque[PendingConfidences | None] | None = None
 
         # Per req-index generation counter, incremented every time a request
         # index is freed in RequestStats. Used for invalidating freed req data
@@ -162,26 +178,72 @@ class PPHandler:
             draft_tokens=slot.draft_tokens,
         )
 
-    def broadcast_drafts(self, draft_tokens: torch.Tensor) -> None:
-        """Broadcast draft proposals so non-last ranks can embed real token ids."""
+    def enable_confidence_relay(self) -> None:
+        self.confidence_queue = deque([None] * self.ring_depth)
+
+    def pop_confidences(self) -> tuple[torch.Tensor, np.ndarray, np.ndarray] | None:
+        """Consume the confidences pushed ring_depth steps ago. Every rank calls
+        this once per executed step, so all ranks apply the same updates at the
+        same step. Returns (confidences, live rows, their request indices)."""
+        assert self.confidence_queue is not None
+        slot = self.confidence_queue.popleft()
+        # Reserve this step's slot; broadcast_drafts/receive fill it.
+        self.confidence_queue.append(None)
+        if slot is None:
+            return None
+        live = self.req_idx_gen_np[slot.idx_mapping_np] == slot.gen_np
+        if not live.any():
+            return None
+        if slot.event is not None:
+            self.main_stream.wait_event(slot.event)
+        rows = np.flatnonzero(live)
+        return slot.confidences, rows, slot.idx_mapping_np[rows]
+
+    def broadcast_drafts(
+        self,
+        draft_tokens: torch.Tensor,
+        input_batch: InputBatch | None = None,
+        confidences: torch.Tensor | None = None,
+    ) -> None:
+        """Broadcast draft proposals so non-last ranks can embed real token ids,
+        and, with adaptive verification, the drafts' confidences."""
         assert self.is_last_rank
         if self.sampled_tokens_broadcast:
+            if confidences is not None:
+                assert input_batch is not None and self.confidence_queue is not None
+                # The speculator reuses its buffer next step.
+                confidences = confidences[: input_batch.num_reqs].clone()
+                self.confidence_queue[-1] = PendingConfidences(
+                    None,
+                    confidences,
+                    input_batch.idx_mapping_np,
+                    self.req_idx_gen_np[input_batch.idx_mapping_np],
+                )
             with torch.cuda.stream(self.broadcast_stream):
                 self.broadcast_stream.wait_stream(self.main_stream)
                 torch.distributed.broadcast(
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
                 )
                 draft_tokens.record_stream(self.broadcast_stream)
+                if confidences is not None:
+                    torch.distributed.broadcast(
+                        confidences, src=self.last_rank, group=self.broadcast_group
+                    )
+                    confidences.record_stream(self.broadcast_stream)
 
-    def receive(self, input_batch: InputBatch, recv_drafts: bool) -> bool:
+    def receive(
+        self, input_batch: InputBatch, recv_drafts: bool, recv_confidences: bool = False
+    ) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
-        requests in the batch. `recv_drafts` must match whether the last rank
-        calls `broadcast_drafts` for this step."""
+        requests in the batch. `recv_drafts` and `recv_confidences` must match
+        whether the last rank calls `broadcast_drafts` for this step, and with
+        confidences."""
         assert not self.is_last_rank
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
             return False
+        recv_confidences = recv_drafts and recv_confidences
 
         # Snapshot the per-slot generation counter so a later free of any of
         # these RequestStates request indices is detectable at consume time.
@@ -209,6 +271,17 @@ class PPHandler:
                 torch.distributed.broadcast(
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
                 )
+            confidences = None
+            if recv_confidences:
+                confidences = torch.empty(
+                    num_reqs,
+                    self.num_speculative_steps,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(
+                    confidences, src=self.last_rank, group=self.broadcast_group
+                )
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
@@ -217,6 +290,13 @@ class PPHandler:
             combined.record_stream(self.main_stream)
             if draft_tokens is not None:
                 draft_tokens.record_stream(self.main_stream)
+            if confidences is not None:
+                confidences.record_stream(self.main_stream)
+        if confidences is not None:
+            assert self.confidence_queue is not None
+            self.confidence_queue[-1] = PendingConfidences(
+                event, confidences, input_batch.idx_mapping_np, gen_at_receive_np
+            )
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,

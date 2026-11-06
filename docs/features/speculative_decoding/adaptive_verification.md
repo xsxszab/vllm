@@ -55,7 +55,8 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
-- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries) or pipeline parallelism (cost curves and confidences exist only on the last rank).
+- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries).
+- With pipeline parallelism, all stages must verify the same drafts, so the drafter's confidences are sent to the other stages along with the drafts and every stage computes the same budget. Each stage profiles its own step cost, and the budget uses the slowest stage's.
 - Without a confidence head, `use_local_argmax_reduction` is rejected. The estimator needs the full draft logits, which local argmax reduction never materializes.
 
 ## Tuning the cost profile

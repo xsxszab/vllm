@@ -185,6 +185,23 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert num_non_draft_tokens == {"low": 1, "high": 1}
 
 
+def test_pp_step_costs_as_much_as_its_slowest_stage():
+    """Microbatches keep every PP stage busy, so the budget follows the slowest
+    stage's cost (stage A here), not the sum over stages, which would admit 2."""
+    stage_a = np.array([1.0, 1.0, 1.0, 1.0, 1.5, 100.0, 100.0])
+    stage_b = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0])
+    manager = make_manager(np.full((2, 2), 0.9, dtype=np.float32), stage_a)
+    manager.cost_tables = (np.zeros((2, 3)), np.stack([stage_a, stage_b]))
+
+    manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+    )
+
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 1
+
+
 def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
