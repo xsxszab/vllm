@@ -5,7 +5,6 @@
 from unittest.mock import Mock
 
 import numpy as np
-import torch
 
 from vllm.v1.worker.gpu import pp_utils
 
@@ -167,30 +166,3 @@ def test_finishing_prefill_row_does_not_drop_a_sibling_row():
 
     assert mask is not None
     assert mask.tolist() == [False, True]
-
-
-def test_confidences_of_a_request_freed_since_drafting_are_dropped():
-    """Draft confidences are applied pp_size steps after drafting; a request
-    slot freed (and maybe reused) in between must not get them."""
-    handler = pp_utils.PPHandler.__new__(pp_utils.PPHandler)
-    handler.ring_depth = 2
-    handler.req_idx_gen_np = np.zeros(4, dtype=np.int32)
-    handler.enable_confidence_relay()
-    confidences = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
-    idx_mapping = np.array([3, 1])
-
-    assert handler.pop_confidences() is None
-    # What broadcast_drafts records on the last rank for this step.
-    assert handler.confidence_queue is not None
-    handler.confidence_queue[-1] = pp_utils.PendingConfidences(
-        None, confidences, idx_mapping, handler.req_idx_gen_np[idx_mapping]
-    )
-    assert handler.pop_confidences() is None
-    handler.on_req_idx_freed(3)
-    popped = handler.pop_confidences()
-
-    assert popped is not None
-    applied, rows, req_idx = popped
-    assert applied is confidences
-    assert rows.tolist() == [1]
-    assert req_idx.tolist() == [1]

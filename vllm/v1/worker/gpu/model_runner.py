@@ -311,16 +311,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.use_aux_hidden_state_outputs = (
                 self.speculative_config.uses_aux_hidden_states
             )
-        # Every PP rank trims the verified drafts, but only the last one has the
-        # speculator that decides whether adaptive verification is on.
-        self.adaptive_verification_enabled: bool = getattr(
-            self.speculator, "enable_adaptive_verification", False
-        )
-        if self.use_pp and self.speculative_config is not None:
-            pp_group = get_pp_group()
-            self.adaptive_verification_enabled = pp_group.broadcast_object(
-                self.adaptive_verification_enabled, src=pp_group.world_size - 1
-            )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -744,8 +734,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
         # The speculator clears the flag at load time when the checkpoint has
         # no confidence head, so it holds the effective value.
+        enable_adaptive_verification = getattr(
+            self.speculator, "enable_adaptive_verification", False
+        )
+        if self.use_pp and self.speculative_config is not None:
+            # Only the last PP rank has the speculator, but every rank trims
+            # the verified drafts.
+            pp_group = get_pp_group()
+            enable_adaptive_verification = pp_group.broadcast_object(
+                enable_adaptive_verification, src=pp_group.world_size - 1
+            )
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
-            enable_adaptive_verification=self.adaptive_verification_enabled,
+            enable_adaptive_verification=enable_adaptive_verification,
             attn_groups=self.attn_groups,
             req_states=self.req_states,
             query_start_loc=self.input_buffers.query_start_loc,

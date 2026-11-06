@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
+from vllm.v1.worker.gpu import pp_utils
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -200,6 +202,108 @@ def test_pp_step_costs_as_much_as_its_slowest_stage():
 
     assert manager._batch_budget is not None
     assert manager._batch_budget[2] == 1
+
+
+def _pp_stage(is_last_rank: bool, pp_lag: int):
+    device = torch.device("cuda")
+    manager = AdaptiveVerificationManager(
+        SimpleNamespace(num_speculative_steps=2, device=device, max_num_reqs=4),
+        torch.zeros(5, dtype=torch.int32, device=device),
+        num_bonus_tokens=1,
+        max_total_logits=1 << 20,
+        pp_lag=pp_lag,
+    )
+    handler = pp_utils.PPHandler.__new__(pp_utils.PPHandler)
+    handler.is_last_rank = is_last_rank
+    handler.last_rank = 1
+    handler.broadcast_group = None
+    handler.device = device
+    handler.num_speculative_steps = 2
+    handler.max_sample_len = 3
+    handler.main_stream = torch.cuda.current_stream(device)
+    handler.broadcast_stream = torch.cuda.Stream(device)
+    handler.sampled_tokens_broadcast = True
+    handler.ring_depth = pp_lag
+    handler.queue = deque([None] * pp_lag)
+    handler.req_idx_gen_np = np.zeros(4, dtype=np.int32)
+    handler.enable_confidence_relay()
+    return manager, handler
+
+
+def _fake_pp_broadcast(monkeypatch):
+    """Stand-in for the PP broadcast: the receiving stream waits for the sent
+    copy, like NCCL. Only the confidences (float32) carry data here."""
+    wire: dict = {}
+
+    def broadcast(tensor, src, group):
+        stream = torch.cuda.current_stream()
+        if wire.get("sending"):
+            if tensor.dtype == torch.float32:
+                wire["payload"] = (tensor.clone(), stream.record_event())
+        elif tensor.dtype == torch.float32:
+            payload, sent = wire["payload"]
+            stream.wait_event(sent)
+            tensor.copy_(payload)
+        else:
+            tensor.zero_()
+
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+    return wire
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pp_ranks_budget_from_identical_confidences(monkeypatch):
+    """Under PP every stage trims the same drafts, so the last stage (which drafts)
+    and an earlier stage (which receives the confidences) must see the same
+    confidences at every step: on the device pp_lag steps after drafting, and
+    in the host budget pp_lag steps after that. Request slot 1 is freed and
+    reused at step 5; the old request's later confidences must not reach it."""
+    wire = _fake_pp_broadcast(monkeypatch)
+    lag = 2
+    first, first_handler = _pp_stage(is_last_rank=False, pp_lag=lag)
+    last, last_handler = _pp_stage(is_last_rank=True, pp_lag=lag)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping=torch.tensor([0, 1], device="cuda"),
+        idx_mapping_np=np.array([0, 1]),
+        num_draft_tokens=4,
+        num_computed_tokens_np=np.array([100, 100], dtype=np.int32),
+        prefill_len_np=np.array([10, 10], dtype=np.int32),
+        num_scheduled_tokens=np.array([3, 3], dtype=np.int32),
+        is_prefilling_np=np.array([False, False]),
+        max_seq_len_np=np.array([2048, 2048], dtype=np.int32),
+    )
+    # The speculator writes each step's confidences into the same buffer.
+    speculator_buffer = torch.empty(4, 2, device="cuda")
+    draft_tokens = torch.zeros(2, 2, dtype=torch.int64, device="cuda")
+
+    for step in range(12):
+        for manager, handler in ((first, first_handler), (last, last_handler)):
+            popped = handler.pop_confidences()
+            if popped is not None:
+                manager.apply_pp_confidences(*popped)
+            if step == 5:
+                handler.on_req_idx_freed(1)
+                manager.add_request(1)
+            manager.snapshot_pp_confidences()
+
+        assert torch.equal(first._confidence_probs, last._confidence_probs)
+        budget_view = first._stale_confidences_np()
+        np.testing.assert_array_equal(budget_view, last._stale_confidences_np())
+        expected_slot0 = (step - lag) / 100 if step >= lag else 1.0
+        assert first._confidence_probs[0, 0].item() == pytest.approx(expected_slot0)
+        expected_budget = (step - 2 * lag) / 100 if step >= 2 * lag else 1.0
+        assert budget_view[0, 0] == pytest.approx(expected_budget)
+        if step == 6:
+            # Drafted for the freed request at step 4.
+            assert first._confidence_probs[1, 0].item() == 1.0
+
+        speculator_buffer.fill_(step / 100)
+        wire["sending"] = True
+        last_handler.broadcast_drafts(draft_tokens, batch, speculator_buffer)
+        wire["sending"] = False
+        first_handler.receive(batch, recv_drafts=True, recv_confidences=True)
+        speculator_buffer.fill_(-1.0)
 
 
 def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
