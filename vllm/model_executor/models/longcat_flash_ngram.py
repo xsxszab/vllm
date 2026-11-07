@@ -185,11 +185,13 @@ class FlashNgramModel(FlashModel):
         loaded: set[str] = set()
         rest: list[tuple[str, torch.Tensor]] = []
         for name, w in weights:
-            if self.ngram_embeddings is not None and (
+            if (
                 "ngram_embeddings.embedders." in name
                 or "ngram_embeddings.post_projs." in name
             ):
-                loaded.add(self.ngram_embeddings.load_weight(name, w))
+                # Only the first PP stage holds the n-gram embedding.
+                if self.ngram_embeddings is not None:
+                    loaded.add(self.ngram_embeddings.load_weight(name, w))
             else:
                 rest.append((name, w))
         loaded |= super().load_weights(rest)
@@ -324,6 +326,9 @@ class LongcatNgramModelState(DefaultModelState):
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)  # positions
+        if self.ngram is None:
+            # Later PP stages take hidden states from the previous stage.
+            return model_inputs
         num_tokens = input_batch.num_tokens
         num_padded = input_batch.num_tokens_after_padding
         input_ids = input_batch.input_ids[:num_tokens]
