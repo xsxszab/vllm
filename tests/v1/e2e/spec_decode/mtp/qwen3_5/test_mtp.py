@@ -10,13 +10,14 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from tests.models.utils import check_logprobs_close
-from tests.utils import single_gpu_only
+from tests.utils import multi_gpu_marks, single_gpu_only
 from vllm import SamplingParams, TokensPrompt
 from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
 from vllm.platforms import current_platform
 from vllm.v1.metrics.reader import Vector
 
 from ...utils import (
+    Messages,
     assert_request_outputs_match,
     compute_acceptance_len,
     get_spec_decode_metric_value,
@@ -304,3 +305,66 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
             context="after weight reload",
         )
         assert al == pytest.approx(ref_al, rel=0.03)
+
+
+def _count_draft_image_positions(worker) -> None:
+    """Count the image positions in the multimodal inputs the drafter receives."""
+    runner = worker.model_runner
+    if runner.speculator is None:
+        return
+    runner.draft_image_positions = 0
+    propose = runner.speculator.propose
+
+    def counting_propose(*args, mm_inputs=None, **kwargs):
+        if mm_inputs is not None:
+            runner.draft_image_positions += int(mm_inputs[1].sum())
+        return propose(*args, mm_inputs=mm_inputs, **kwargs)
+
+    runner.speculator.propose = counting_propose
+
+
+def _draft_image_positions(worker) -> int | None:
+    return getattr(worker.model_runner, "draft_image_positions", None)
+
+
+def _run_draft_image_positions(
+    vllm_runner, prompts: list[Messages], tp_size: int, pp_size: int
+) -> list[int]:
+    with vllm_runner(
+        "Qwen/Qwen3.5-0.8B",
+        block_size=None,
+        enable_chunked_prefill=None,
+        max_model_len=4096,
+        enforce_eager=True,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        distributed_executor_backend="mp",
+        limit_mm_per_prompt={"image": 1, "video": 0},
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+    ) as runner:
+        runner.collective_rpc(_count_draft_image_positions)
+        runner.llm.chat(prompts, SamplingParams(temperature=0, max_tokens=8))
+        counts = runner.collective_rpc(_draft_image_positions)
+    return [n for n in counts if n is not None]
+
+
+@pytest.mark.parametrize(
+    "tp_size",
+    [
+        pytest.param(1, marks=multi_gpu_marks(num_gpus=2)),
+        # The CPU position mask and the TP-sliced embeddings cross the stage
+        # boundary.
+        pytest.param(2, marks=multi_gpu_marks(num_gpus=4)),
+    ],
+)
+def test_mtp_drafter_receives_image_embeddings_with_pp(
+    monkeypatch: pytest.MonkeyPatch, vllm_runner, tp_size: int
+):
+    """With PP, the encoder cache is on the first stage and the drafter on the
+    last one; the drafter must receive the same image embeddings as at PP=1."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    prompts = get_test_prompts(mm_enabled=True, num_prompts=6)
+    (expected,) = _run_draft_image_positions(vllm_runner, prompts, 1, 1)
+    assert expected > 0
+    positions = _run_draft_image_positions(vllm_runner, prompts, tp_size, 2)
+    assert positions == [expected] * tp_size

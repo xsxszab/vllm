@@ -213,7 +213,7 @@ class PipelineBench(ForwardBench):
             for key, tensor in self.input_tensors.tensors.items():
                 if not tensor.numel():
                     continue
-                sharded = pp._should_use_all_gather(key, tensor.numel(), tp, None)
+                sharded = pp._should_use_all_gather(key, tensor, tp, None)
                 buffer = (
                     torch.empty_like(tensor.reshape(tp.world_size, -1)[0])
                     if sharded
@@ -224,7 +224,7 @@ class PipelineBench(ForwardBench):
         if not pp.is_last_rank:
             for key, tensor in _tensors(self.output).items():
                 if tensor.numel():
-                    if pp._should_use_all_gather(key, tensor.numel(), tp, None):
+                    if pp._should_use_all_gather(key, tensor, tp, None):
                         tensor = tensor.reshape(tp.world_size, -1)[tp.rank_in_group]
                     sent.append(tensor)
         clock = None if profile else PipelineClock()

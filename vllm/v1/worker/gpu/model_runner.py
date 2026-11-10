@@ -447,6 +447,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        if (
+            self.pp_handler is not None
+            and self.supports_mm_inputs
+            and self.speculative_config is not None
+        ):
+            self.pp_handler.configure_draft_mm_relay(
+                self.speculator is not None and self.speculator.supports_mm_inputs
+            )
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -2048,6 +2056,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_ids = input_batch.input_ids
         inputs_embeds = None
         ec_connector_output = None
+        draft_mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.uses_inputs_embeds and self.is_first_pp_rank:
             # Prepare inputs_embeds (MM encoder outputs and/or prompt_embeds
             # overlay). Only first PP rank prepares them.
@@ -2072,6 +2081,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) as ec_connector_output:
                     inputs_embeds = self.model_state.prepare_inputs_embeds(
                         scheduled_encoder_inputs, input_batch, self.req_states
+                    )
+                if (
+                    self.pp_handler is not None
+                    and self.pp_handler.relay_draft_mm_inputs
+                ):
+                    # The drafter reads one position ahead of the target.
+                    draft_mm_inputs = self.model_state.gather_mm_embeddings(
+                        input_batch, draft_lookahead=1
                     )
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
@@ -2102,6 +2119,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for k, v in self.intermediate_tensors.tensors.items()
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+            assert self.pp_handler is not None
+            if self.pp_handler.relay_draft_mm_inputs:
+                draft_mm_inputs = self.pp_handler.unpack_draft_mm_inputs(
+                    intermediate_tensors
+                )
             del intermediate_tensors
 
         # Update the EPLB meta.
@@ -2204,14 +2226,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_spec_tokens_to_schedule=(
                 0 if skip_drafts else scheduler_output.num_spec_tokens_to_schedule
             ),
+            draft_mm_inputs=draft_mm_inputs,
         )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
-            return self.pp_handler.relay_aux_hidden_states(
+            output_intermediate_tensors = self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
+            )
+            return self.pp_handler.pack_draft_mm_inputs(
+                output_intermediate_tensors, draft_mm_inputs
             )
         return None
 
@@ -2234,6 +2260,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        draft_mm_inputs = self.execute_model_state.draft_mm_inputs
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2328,9 +2355,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids, defer_finalize=defer_kv_finalize
         )
 
-        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        # The encoder runner exists only on the first PP rank, so later ranks
-        # have no cached embeddings to gather.
+        # With PP, the encoder cache is on the first rank, which sends these
+        # embeddings with the intermediate tensors.
+        mm_inputs = draft_mm_inputs
         if (
             self.speculator is not None
             and self.speculator.supports_mm_inputs
@@ -2559,6 +2586,8 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
+    # The drafter's multimodal inputs sent by the first PP rank.
+    draft_mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
 
 
 class BatchReqState(NamedTuple):

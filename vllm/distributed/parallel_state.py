@@ -1073,13 +1073,14 @@ class GroupCoordinator:
     def _should_use_all_gather(
         self,
         key: str,
-        numel: int,
+        tensor: torch.Tensor,
         all_gather_group: "GroupCoordinator | None",
         all_gather_tensors: dict[str, bool] | None,
     ) -> bool:
-        if all_gather_group is None:
+        # The all-gather runs on the device group, so CPU tensors are sent whole.
+        if all_gather_group is None or tensor.is_cpu:
             return False
-        use_all_gather = numel % all_gather_group.world_size == 0
+        use_all_gather = tensor.numel() % all_gather_group.world_size == 0
         if all_gather_tensors is not None:
             use_all_gather = all_gather_tensors.get(key, use_all_gather)
         return use_all_gather
@@ -1222,7 +1223,7 @@ class GroupCoordinator:
                 continue
 
             if self._should_use_all_gather(
-                key, tensor.numel(), all_gather_group, all_gather_tensors
+                key, tensor, all_gather_group, all_gather_tensors
             ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
@@ -1336,7 +1337,7 @@ class GroupCoordinator:
                     continue
 
                 if self._should_use_all_gather(
-                    key, full_tensor.numel(), all_gather_group, all_gather_tensors
+                    key, full_tensor, all_gather_group, all_gather_tensors
                 ):
                     orig_shape = full_tensor.shape
                     slice_tensor = full_tensor.reshape(all_gather_size, -1)[

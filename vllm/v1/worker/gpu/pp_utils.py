@@ -10,10 +10,15 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+# Keys of the drafter's multimodal inputs in the tensors sent between stages.
+_DRAFT_MM_MASK_KEY = "draft_is_mm_embed"
+_DRAFT_MM_EMBEDS_KEY_PREFIX = "draft_mm_embeds."
 
 
 @dataclass
@@ -100,6 +105,9 @@ class PPHandler:
         self.upstream_aux_keys: tuple[str, ...] = ()
         self.local_aux_keys: tuple[str, ...] = ()
         self.num_aux_hidden_states = 0
+        # Whether the first stage, which holds the encoder cache, sends the
+        # drafter's multimodal embeddings to the last stage.
+        self.relay_draft_mm_inputs = False
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -167,6 +175,49 @@ class PPHandler:
                 "forward must take them at global layer indices."
             )
         return hidden_states, aux_hidden_states
+
+    def configure_draft_mm_relay(self, draft_supports_mm_inputs: bool) -> None:
+        """Relay multimodal embeddings if the drafter, which only the last stage
+        loads, consumes them. Must be called on every PP rank."""
+        pp_group = get_pp_group()
+        self.relay_draft_mm_inputs = pp_group.broadcast_object(
+            draft_supports_mm_inputs, src=pp_group.world_size - 1
+        )
+
+    def pack_draft_mm_inputs(
+        self,
+        output_intermediate_tensors: IntermediateTensors,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> IntermediateTensors:
+        """Add the drafter's multimodal embeddings and their CPU position mask
+        to the tensors sent to the next stage."""
+        if mm_inputs is None or not mm_inputs[0]:
+            return output_intermediate_tensors
+        mm_embeds, is_mm_embed = mm_inputs
+        tensors = dict(output_intermediate_tensors.tensors)
+        tensors[_DRAFT_MM_MASK_KEY] = is_mm_embed
+        for i, mm_embed in enumerate(mm_embeds):
+            modality = getattr(mm_embed, "modality", "")
+            key = f"{_DRAFT_MM_EMBEDS_KEY_PREFIX}{i}.{modality}"
+            tensors[key] = mm_embed.contiguous()
+        return IntermediateTensors(tensors)
+
+    def unpack_draft_mm_inputs(
+        self, intermediate_tensors: IntermediateTensors
+    ) -> tuple[list[torch.Tensor], torch.Tensor] | None:
+        """Return the drafter's multimodal inputs sent by the previous stage."""
+        is_mm_embed = intermediate_tensors.tensors.get(_DRAFT_MM_MASK_KEY)
+        if is_mm_embed is None:
+            return None
+        mm_embeds: list[torch.Tensor] = []
+        for key, mm_embed in intermediate_tensors.tensors.items():
+            if not key.startswith(_DRAFT_MM_EMBEDS_KEY_PREFIX):
+                continue
+            modality = key.rsplit(".", 1)[1]
+            if modality:
+                set_mm_embedding_modality(mm_embed, modality)
+            mm_embeds.append(mm_embed)
+        return mm_embeds, is_mm_embed
 
     def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
