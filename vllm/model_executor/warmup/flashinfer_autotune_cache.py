@@ -112,7 +112,7 @@ def resolve_flashinfer_autotune_v2_root(runner: "GPUModelRunner") -> Path | None
     software/hardware environment, and agrees on every cached selection across
     the tuning group before using it. The store therefore needs no vLLM config
     hash: one per-rank store serves every engine configuration, so changing an
-    unrelated setting (e.g. `max_num_seqs`) does not retune unchanged operations.
+    unrelated setting (e.g. `max_model_len`) does not retune unchanged operations.
     """
     from vllm.distributed.parallel_state import get_world_group
 
