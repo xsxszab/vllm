@@ -35,8 +35,10 @@ the legacy cache because their cache-transfer protocols require legacy
 serialization. Older FlashInfer installations without the managed-cache API
 also use the legacy path. There is no separate v1/v2 selection flag.
 
-Multi-rank deployments using v2 persist a separate managed cache for each model
-configuration, data-parallel rank and world rank. Set
+Multi-rank deployments using v2 persist a separate managed cache for each
+data-parallel rank and world rank, shared across engine configurations:
+FlashInfer keys each entry by operation, shape and environment, so a restart
+with different settings retunes only operations it has not tuned before. Set
 `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR` to choose the parent directory; it can be
 node-local or shared. Without an override, multi-rank managed caches use
 `$VLLM_CACHE_ROOT/flashinfer_autotune_cache/`, while single-rank managed caches

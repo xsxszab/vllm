@@ -106,7 +106,14 @@ def use_flashinfer_autotune_v2(runner: "GPUModelRunner") -> bool:
 
 
 def resolve_flashinfer_autotune_v2_root(runner: "GPUModelRunner") -> Path | None:
-    """Isolate distributed writers while FlashInfer owns entry compatibility."""
+    """Isolate distributed writers while FlashInfer owns entry compatibility.
+
+    FlashInfer keys each managed entry by operation, runner, shape profile and
+    software/hardware environment, and agrees on every cached selection across
+    the tuning group before using it. The store therefore needs no vLLM config
+    hash: one per-rank store serves every engine configuration, so changing an
+    unrelated setting (e.g. `max_num_seqs`) does not retune unchanged operations.
+    """
     from vllm.distributed.parallel_state import get_world_group
 
     world = get_world_group()
@@ -114,7 +121,6 @@ def resolve_flashinfer_autotune_v2_root(runner: "GPUModelRunner") -> Path | None
         dp_rank = runner.vllm_config.parallel_config.data_parallel_rank
         return (
             flashinfer_autotune_root()
-            / flashinfer_autotune_cache_hash(runner)
             / f"managed_dp{dp_rank}_rank{world.rank_in_group}"
         )
     override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR

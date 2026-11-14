@@ -11,13 +11,15 @@ from tests.models.utils import check_logprobs_close
 def test_managed_cache_survives_distributed_restart(
     vllm_runner, monkeypatch, tmp_path, tp, pp
 ):
-    """Each rank persists managed winners and reuses them after worker restart."""
+    """Each rank persists managed winners and reuses them after worker restart,
+    also when the restart changes a setting that the vLLM config hash covers
+    but the tuned operations do not depend on (CUDA graph capture sizes)."""
     monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     prompts = ["The capital of France is", "In Python, an empty list is"]
     results = []
     cache_entries = []
-    for _ in range(2):
+    for capture_sizes in ([1, 2, 4], [1, 2]):
         with vllm_runner(
             "nvidia/Qwen3-8B-FP8",
             tensor_parallel_size=tp,
@@ -32,7 +34,7 @@ def test_managed_cache_survives_distributed_restart(
                 "enable_flashinfer_autotune": True,
                 "linear_backend": "flashinfer_cutlass",
             },
-            compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
+            compilation_config={"cudagraph_capture_sizes": capture_sizes},
         ) as model:
             results.append(model.generate_greedy_logprobs(prompts, 16, 5))
         entries = {
