@@ -30,6 +30,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
+from vllm.distributed.kv_transfer import init_early_recv_reporting
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -69,11 +70,7 @@ from vllm.utils.torch_utils import (
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
-from vllm.v1.executor.early_kv_recv import (
-    EarlyKVOutputAggregator,
-    EarlyKVRecvReceiver,
-    EarlyKVRecvSender,
-)
+from vllm.v1.executor.early_kv_recv import EarlyKVOutputAggregator, EarlyKVRecvReceiver
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -782,7 +779,6 @@ class WorkerProc:
     READY_STR = "READY"
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
-    early_kv_recv: EarlyKVRecvSender | None = None
 
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
@@ -878,9 +874,8 @@ class WorkerProc:
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
 
-        self.early_kv_recv = (
-            EarlyKVRecvSender(early_kv_recv_path) if early_kv_recv_path else None
-        )
+        if early_kv_recv_path:
+            init_early_recv_reporting(early_kv_recv_path)
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -1005,8 +1000,6 @@ class WorkerProc:
             self.rpc_broadcast_mq.shutdown()
         if self.worker_response_mq is not None:
             self.worker_response_mq.shutdown()
-        if self.early_kv_recv is not None:
-            self.early_kv_recv.close()
         self.worker.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
@@ -1193,15 +1186,6 @@ class WorkerProc:
                 else:
                     output = e
 
-        if (
-            self.early_kv_recv is not None
-            and not self.use_async_scheduling
-            and isinstance(output, ModelRunnerOutput)
-        ):
-            # The engine schedules as soon as it gets this output, so report
-            # the step's completed receives before sending it.
-            self.early_kv_recv.poll()
-
         if isinstance(output, ExceptionWithKVConnectorOutput):
             result: tuple[WorkerProc.ResponseStatus, Any] = (
                 WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT,
@@ -1244,29 +1228,10 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers."""
         assert self.rpc_broadcast_mq is not None
-        early_kv_recv = self.early_kv_recv
         while True:
-            while early_kv_recv is not None and early_kv_recv.wait_for_poll(
-                self.rpc_broadcast_mq
-            ):
-                get_watch_dog().feed()
-                early_kv_recv.poll()
             with get_watch_dog().disable():
                 rpc_request = self.rpc_broadcast_mq.dequeue(indefinite=True)
             self._execute_worker_rpc(rpc_request)
-            if early_kv_recv is not None and rpc_request[0] in (
-                "execute_model",
-                "sample_tokens",
-            ):
-                # Only step RPCs keep idle polling active, so a sleep RPC
-                # after a pause does not restart it.
-                early_kv_recv.step_rpc_done()
-                output_rank = rpc_request[3]
-                if self.use_async_scheduling or output_rank not in (None, self.rank):
-                    # Report receives found during the step now; its output is
-                    # ready only after the GPU finishes the step. A synchronous
-                    # replying worker polls in enqueue_output() instead.
-                    early_kv_recv.poll()
             del rpc_request
 
     def _execute_worker_rpc(

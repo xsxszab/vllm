@@ -4603,7 +4603,6 @@ def test_early_recv_leaves_post_processing_to_the_step(
     )
     worker._recving_transfers["request"] = [101]
     worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
-    assert not worker.has_pending_recving()
     assert worker.poll_finished_recving() == set()
     assert worker.get_transfer_results().finished_recving == {"request"}
     assert worker.poll_finished_recving() == set()
@@ -4620,7 +4619,6 @@ def test_early_recv_leaves_failures_to_the_step(recv_worker):
         None,
     ]
     assert worker.poll_finished_recving() == set()
-    assert not worker.has_pending_recving()
     assert worker.poll_finished_recving() == set()
     assert worker.nixl_wrapper.check_xfer_state.call_count == 1
     results = worker.get_transfer_results()

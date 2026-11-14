@@ -326,7 +326,7 @@ By default, a completed load is reported to the scheduler with the output of a l
 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","enable_early_recv":true}'
 ```
 
-PP > 1 is supported, unlike with NixlConnector (pull). See [Early Receive Reporting](nixl_connector_usage.md#early-receive-reporting) for the other supported setups and the polling overhead.
+PP > 1 is supported, unlike with NixlConnector (pull). See [Early Receive Reporting](nixl_connector_usage.md#early-receive-reporting) for the other supported setups and when loads are reported.
 
 ## Environment Variables
 

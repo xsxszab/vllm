@@ -97,12 +97,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             results.finished_recving.difference_update(self._early_recved)
         return results
 
-    def has_pending_recving(self) -> bool:
-        return self._early_recved is not None and (
-            bool(self._early_recved)
-            or any(self._can_early_recv(r) for r in self._recving_transfers)
-        )
-
     def poll_finished_recving(self) -> set[str]:
         assert self._early_recved is not None
         # Ineligible and failed requests stay untouched for ordinary collection.

@@ -6,10 +6,13 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import zmq
 
 import vllm.v1.worker.gpu.kv_connector as kv_connector_module
 from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
+from vllm.utils.network_utils import get_open_zmq_ipc_path, make_zmq_socket
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 
 
@@ -119,3 +122,29 @@ def test_deferred_finalize_collects_results_before_saving(
 
     connector.finalize_step()
     assert events == ["handle", "bind", "start", "results", "wait", "clear"]
+
+
+def test_post_forward_sends_early_receives(monkeypatch: pytest.MonkeyPatch):
+    """Loads that finished early reach the engine during the step, after its
+    transfer results are collected and ahead of the step output."""
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events)
+
+    def poll_finished_recving():
+        events.append("poll")
+        return {"request"}
+
+    backend = connector.kv_connector
+    assert isinstance(backend, Mock)
+    backend.poll_finished_recving.side_effect = poll_finished_recving
+    path = get_open_zmq_ipc_path()
+    engine_end = make_zmq_socket(zmq.Context.instance(), path, zmq.PULL)
+    kv_transfer_state.init_early_recv_reporting(path)
+    try:
+        connector.post_forward(set())
+        assert engine_end.poll(timeout=5000)
+        assert engine_end.recv_pyobj() == {"request"}
+    finally:
+        kv_transfer_state.ensure_kv_transfer_shutdown()
+        engine_end.close(linger=0)
+    assert events == ["wait", "results", "poll", "clear"]

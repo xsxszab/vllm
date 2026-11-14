@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING
+
+import torch
+import zmq
 
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -8,12 +12,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
+from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_socket
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 _KV_CONNECTOR_AGENT: KVConnectorBaseType | None = None
+# Worker end of the engine's early receive channel (multiprocessing executor).
+_EARLY_RECV_SOCKET: zmq.Socket | None = None
+
+logger = init_logger(__name__)
 
 
 def get_kv_transfer_group() -> KVConnectorBaseType:
@@ -90,8 +100,38 @@ def ensure_kv_transfer_initialized(
         )
 
 
+def init_early_recv_reporting(path: str) -> None:
+    """Report KV loads that finish early to the engine over the channel at `path`."""
+    global _EARLY_RECV_SOCKET
+    _EARLY_RECV_SOCKET = make_zmq_socket(zmq.Context.instance(), path, zmq.PUSH)
+
+
+def report_early_finished_recving(connector: KVConnectorBase_V1) -> None:
+    """Send the loads `connector` finished successfully since the last report.
+
+    Called by the model runner during each step. A no-op unless
+    `init_early_recv_reporting()` was called in this process.
+    """
+    if _EARLY_RECV_SOCKET is None:
+        return
+    try:
+        with torch.inference_mode():
+            req_ids = connector.poll_finished_recving()
+        if req_ids:
+            _EARLY_RECV_SOCKET.send_pyobj(req_ids)
+    except Exception:
+        logger.exception("Early KV receive poll failed")
+        # Receive state may already be lost, so no later step or fault
+        # tolerance retry can complete these loads; the worker monitor stops
+        # the engine.
+        os._exit(1)
+
+
 def ensure_kv_transfer_shutdown() -> None:
-    global _KV_CONNECTOR_AGENT
+    global _KV_CONNECTOR_AGENT, _EARLY_RECV_SOCKET
     if _KV_CONNECTOR_AGENT is not None:
         _KV_CONNECTOR_AGENT.shutdown()
         _KV_CONNECTOR_AGENT = None
+    if _EARLY_RECV_SOCKET is not None:
+        _EARLY_RECV_SOCKET.close(linger=0)
+        _EARLY_RECV_SOCKET = None

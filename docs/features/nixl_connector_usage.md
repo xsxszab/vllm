@@ -446,8 +446,8 @@ A decoder normally learns that a NIXL pull finished from the output of a later s
 ```
 
 - **Supported**: the `uni` executor or single-node `mp`, sync or async scheduling, and TP, with NixlConnector (pull) or MooncakeStoreConnector, used directly or inside MultiConnector. NIXL pull requires PP to be 1 regardless of the KV role; MooncakeStoreConnector also works with PP > 1.
-- **Unchanged**: a request still waits for every rank and for free KV blocks, and transfer failures and invalid blocks follow `kv_load_failure_policy`; a load with an error on any rank completes through step outputs, after the error. Unexpected polling errors stop the engine, even while it is paused.
-- **Overhead**: with `mp`, workers poll every 0.2 ms between RPCs while pulls are pending. An RPC that arrives during a poll waits for it to finish.
+- **Unchanged**: a request still waits for every rank and for free KV blocks, and transfer failures and invalid blocks follow `kv_load_failure_policy`; a load with an error on any rank completes through step outputs, after the error. An unexpected error while collecting completed loads stops the engine.
+- **When loads are reported**: each worker reports completed loads when a step collects its KV transfer results and, with sync scheduling, again once the step output is ready. A load that completes while a worker waits for its next step is reported during that step.
 - **NIXL scope**: early reporting is limited to direct receives with matching block sizes and physical block layouts, without layout conversion or padding zeroing. Receives requiring any of those operations or host-buffer staging use regular step outputs even when `enable_early_recv` is true. Transfer metrics are still reported with regular step outputs.
 
 ## Metrics Reference

@@ -5684,7 +5684,6 @@ def test_early_recv_reports_only_error_free_loads_early(is_hma_required):
         meta.add_request(_make_load_req(req_id, [b"h0", b"h1"], token_len=32))
 
     w.start_load_kv(meta)
-    assert w.has_pending_recving()
     for _ in range(2):
         recv_thread._handle_request(w.recv_request_queue.get_nowait())
 
@@ -5697,9 +5696,7 @@ def test_early_recv_reports_only_error_free_loads_early(is_hma_required):
     # An error-free load found by the step's get_finished() waits for the poll.
     recv_thread._handle_request(w.recv_request_queue.get_nowait())
     assert w.get_transfer_results(set(), meta).finished_recving == set()
-    assert w.has_pending_recving()
     assert w.poll_finished_recving() == {"late"}
-    assert not w.has_pending_recving()
     assert w.poll_finished_recving() == set()
 
 

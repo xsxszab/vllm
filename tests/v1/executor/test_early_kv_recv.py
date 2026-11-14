@@ -10,14 +10,20 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 
 def test_poll_failure_exits_worker():
-    # Without a KV connector the poll fails. Exceptions are suppressed so that
-    # only os._exit(1) can produce exit code 1.
+    # Exceptions are suppressed so that only os._exit(1) can produce exit code 1.
     code = """
 from contextlib import suppress
+from unittest.mock import Mock
 with suppress(Exception):
-    from vllm.v1.executor.early_kv_recv import EarlyKVRecvSender
+    from vllm.distributed.kv_transfer import (
+        init_early_recv_reporting,
+        report_early_finished_recving,
+    )
     from vllm.utils.network_utils import get_open_zmq_ipc_path
-    EarlyKVRecvSender(get_open_zmq_ipc_path()).poll()
+    init_early_recv_reporting(get_open_zmq_ipc_path())
+    connector = Mock()
+    connector.poll_finished_recving.side_effect = RuntimeError("poll")
+    report_early_finished_recving(connector)
 """
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=30

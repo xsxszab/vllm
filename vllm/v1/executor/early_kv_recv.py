@@ -1,28 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Report completed KV loads between model outputs and the next schedule()."""
+"""Engine side of early KV receive reporting: collect the workers' reports and
+count them in the receive quorum before the next schedule()."""
 
-import os
-import time
 from itertools import chain
 
-import torch
 import zmq
 
-from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
-from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_zmq_ipc_path, make_zmq_socket
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
-
-logger = init_logger(__name__)
-
-# Interval between polls while the worker waits for its next RPC.
-_POLL_INTERVAL_S = 0.0002
-# Without a step RPC for this long the engine is idle or paused: stop polling
-# and let the worker block in dequeue().
-_ACTIVE_WINDOW_S = 1.0
 
 
 class EarlyKVOutputAggregator(KVOutputAggregator):
@@ -86,54 +73,6 @@ class EarlyKVRecvReceiver:
                 notifications.append(self._socket.recv_pyobj(zmq.NOBLOCK))
             except zmq.Again:
                 return notifications
-
-    def close(self) -> None:
-        self._socket.close(linger=0)
-
-
-class EarlyKVRecvSender:
-    """Worker end: polls the KV connector between RPCs."""
-
-    def __init__(self, path: str) -> None:
-        self._socket = make_zmq_socket(zmq.Context.instance(), path, zmq.PUSH)
-        self._last_step_rpc = time.monotonic()
-        self._next_poll = 0.0
-
-    def step_rpc_done(self) -> None:
-        """Record that an `execute_model` or `sample_tokens` RPC finished."""
-        self._last_step_rpc = time.monotonic()
-
-    def wait_for_poll(self, rpc_mq: MessageQueue) -> bool:
-        """Spin until the next poll is due and return True.
-
-        Return False as soon as an RPC is queued, or immediately when no step
-        RPC arrived recently or no receive is pending.
-        """
-        if (
-            time.monotonic() - self._last_step_rpc > _ACTIVE_WINDOW_S
-            or not has_kv_transfer_group()
-            or not get_kv_transfer_group().has_pending_recving()
-        ):
-            return False
-        rpc_mq.spin_until_readable((), self._next_poll)
-        return not (rpc_mq.shutting_down or rpc_mq.readable())
-
-    def poll(self) -> None:
-        """Send completed receives; let the worker monitor handle fatal errors."""
-        try:
-            with torch.inference_mode():
-                req_ids = get_kv_transfer_group().poll_finished_recving()
-            if req_ids:
-                self._socket.send_pyobj(req_ids)
-        except Exception:
-            logger.exception("Early KV receive poll failed")
-            # Wake the monitor even while the engine is paused. Receive state
-            # may already be lost; neither a later RPC nor a retry can recover it.
-            os._exit(1)
-        finally:
-            # Measured from the end of a poll, so long polls do not run back
-            # to back.
-            self._next_poll = time.monotonic() + _POLL_INTERVAL_S
 
     def close(self) -> None:
         self._socket.close(linger=0)
