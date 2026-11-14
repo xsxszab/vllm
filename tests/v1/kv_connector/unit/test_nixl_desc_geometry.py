@@ -296,17 +296,24 @@ def test_packed_push_compatibility_hash_uses_all_backends_in_stable_order(
     "worker_cls", [NixlPullConnectorWorker, NixlPushConnectorWorker]
 )
 @pytest.mark.parametrize("packed", [False, True])
-def test_compatibility_backend_ignores_indexers(worker_cls, packed):
+def test_compatibility_backend_ignores_auxiliary_caches(worker_cls, packed):
     """GLM-5.x builds an indexer on some layers only, so a PP stage starting
     on a layer without one lists the sparse MLA backend first, or holds no
-    indexer at all, while its PP=1 peer starts with the indexer. All must
-    hash the same backend."""
-    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+    indexer at all, while its PP=1 peer starts with the indexer. A
+    DeepSeek-V4 stage starting on a compressed layer lists its indexer and
+    compressor first, while the PP=1 peer starts with an uncompressed layer.
+    All must hash the same backend."""
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV4IndexerBackend,
+        DeepseekV32IndexerBackend,
+    )
 
-    class _SparseMLA:
-        @staticmethod
-        def get_name():
-            return "FLASHINFER_MLA_SPARSE"
+    def named(name):
+        return type(name, (), {"get_name": staticmethod(lambda: name)})
+
+    sparse_mla = named("FLASHINFER_MLA_SPARSE")
+    swa, v4_mla = named("DEEPSEEK_SPARSE_SWA"), named("FLASHMLA_SPARSE_DSV4")
+    compressor = named("CompressorBackend")
 
     def backend_name(attn_backends):
         worker = SimpleNamespace(
@@ -317,10 +324,13 @@ def test_compatibility_backend_ignores_indexers(worker_cls, packed):
         return bw.NixlBaseConnectorWorker._compat_backend_name(worker)
 
     assert (
-        backend_name([DeepseekV32IndexerBackend, _SparseMLA])
-        == backend_name([_SparseMLA, DeepseekV32IndexerBackend])
-        == backend_name([_SparseMLA])
+        backend_name([DeepseekV32IndexerBackend, sparse_mla])
+        == backend_name([sparse_mla, DeepseekV32IndexerBackend])
+        == backend_name([sparse_mla])
     )
+    assert backend_name(
+        [swa, v4_mla, DeepseekV4IndexerBackend, compressor]
+    ) == backend_name([DeepseekV4IndexerBackend, compressor, swa, v4_mla])
 
 
 @pytest.mark.cpu_test

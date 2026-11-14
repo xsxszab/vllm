@@ -110,6 +110,8 @@ _SHARED_REGION_GROUP_ID = -1
 _INVALID_PEER_MIN_BACKOFF_S = 1.0
 _INVALID_PEER_MAX_BACKOFF_S = 60.0
 _MAX_HYBRID_BLOCK_SPLIT = 128
+# Compressor state caches of DeepSeek-V4 / V4.1 compressed layers.
+_AUXILIARY_CACHE_BACKENDS = frozenset({"CompressorBackend"})
 
 
 def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
@@ -469,8 +471,11 @@ class NixlBaseConnectorWorker:
     def _compat_backend_name(self) -> str:
         """Attention backend name folded into the compatibility hash.
 
-        A PP stage may hold no indexer layer (GLM-5.x builds an indexer on some
-        layers only), so indexer backends do not count.
+        Backends list in the order of this worker's layers, so a PP stage
+        starting on another kind of layer lists them in another order. Indexer
+        and compressor caches exist only on some layers (GLM-5.x indexers,
+        DeepSeek-V4 compressed layers) and may come first or be missing on a
+        stage, so they do not count.
         """
         from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 
@@ -481,6 +486,7 @@ class NixlBaseConnectorWorker:
                 isinstance(backend, type)
                 and issubclass(backend, DeepseekV32IndexerBackend)
             )
+            and backend.get_name() not in _AUXILIARY_CACHE_BACKENDS
         ] or self.attn_backends
         if self._supports_pp_hma and self._has_packed_cache:
             # PP can reorder the same backends across stages of a packed model.

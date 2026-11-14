@@ -79,8 +79,8 @@ By default, a **compatibility hash** is checked during handshake. P and D instan
 
 - vLLM version and NIXL connector version
 - Model (architecture, dtype, number of KV heads, head size, number of hidden layers)
-- Attention backend (sparse-MLA indexer backends do not count, since a
-  pipeline-parallel stage may hold no indexer layer)
+- Attention backend (indexer and compressor caches do not count, since a
+  pipeline-parallel stage may hold none of them or list them first)
 - KV cache dtype (`cache_dtype`)
 - EAGLE/MTP-style speculative method and draft-model configuration
 - NIXL transfer mode (push vs pull) — a push (WRITE) connector and a pull (READ)
