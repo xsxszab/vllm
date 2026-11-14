@@ -2611,6 +2611,7 @@ def _make_pp_attn_worker(
     kernel_block_size=4,
     nixl_wrapper=_RecordingNixl,
     layout=KVCacheLayout.LBHNC,
+    mla=False,
 ):
     """Pull worker holding `layer_names` of a model with full-attention
     `_PP_TARGET_LAYERS` and a draft's `_PP_DRAFT_LAYER`.
@@ -2620,13 +2621,14 @@ def _make_pp_attn_worker(
     allocation, unless `shared` overlays the groups on one, as one block pool
     does: the draft layer then aliases the first target layer the worker holds.
     `pp_stage=(pp_rank, pp_size)` makes the worker that prefill PP stage.
+    `mla` gives every layer an MLA cache.
     """
     kwargs = dict(
         block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.float16
     )
     target = [name for name in _PP_TARGET_LAYERS if name in layer_names]
     draft = [_PP_DRAFT_LAYER] if _PP_DRAFT_LAYER in layer_names else []
-    spec = AttentionSpec(**kwargs)
+    spec = MLAAttentionSpec(**kwargs) if mla else AttentionSpec(**kwargs)
     full = FullAttentionManager.config()
 
     def make_group(names, manager_config):
@@ -2701,6 +2703,7 @@ def _make_pp_attn_worker(
         worker = NixlPullConnectorWorker(
             config, engine_id, KVCacheConfig(num_blocks, tensors, groups)
         )
+        worker.use_mla = mla
         worker.register_kv_caches(caches)
     return worker
 
@@ -2717,10 +2720,12 @@ def _pp_stage_metadata(stage, pp_rank):
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("layout", [KVCacheLayout.BLHNC, KVCacheLayout.BHLNC])
 @pytest.mark.parametrize("hma", [False, True])
-def test_pull_pp_rejects_packed_layout_before_registering(layout, hma):
-    """Reject packed PP before cache registration, independently of HMA."""
+def test_pull_pp_stage_rejects_packed_non_mla_caches_before_registering(layout, hma):
+    """A packed PP stage registers each layer page apart, which only MLA pages
+    (whole on every TP rank) support; reject others before registration,
+    independently of HMA."""
     wrapper = _RecordingNixl()
-    with pytest.raises(NotImplementedError, match="pull.*packed.*" + layout.name):
+    with pytest.raises(NotImplementedError, match="packed.*require MLA"):
         _make_pp_attn_worker(
             "prefill",
             _PP_TARGET_LAYERS[:2],
@@ -2738,8 +2743,9 @@ def test_pull_pp_rejects_packed_layout_before_registering(layout, hma):
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("layout", [KVCacheLayout.BLHNC, KVCacheLayout.BHLNC])
 @pytest.mark.parametrize("packed_endpoint", ["local", "remote", "both"])
-def test_pull_pp_rejects_packed_peer_before_pairing(layout, packed_endpoint):
-    """A packed PP peer fails capability checks before descriptor setup.
+def test_pull_pp_rejects_packed_non_mla_peer_before_pairing(layout, packed_endpoint):
+    """A non-MLA packed layout on either side of a PP pull fails capability
+    checks before descriptor setup.
 
     PP1 construction supplies real packed rows for a peer running older code;
     the advertised PP topology is a separate handshake argument.
@@ -2916,6 +2922,117 @@ def test_pull_from_hma_pp_stages_reads_each_group_from_its_stage(shared, pp_size
     assert pairs == _expected_page_pairs(
         decode, stages, local_block_ids, remote_block_ids
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("layout", [KVCacheLayout.BLHNC, KVCacheLayout.BHLNC])
+def test_pull_from_packed_mla_pp_stages_reads_each_page_into_its_row(layout):
+    """A packed MLA decoder registers whole block rows, while each prefill PP
+    stage registers its layers' pages apart. Pulls from the stages read every
+    page into its place inside the local rows, and the decoder's own
+    registration keeps one descriptor per row."""
+    layers = [*_PP_TARGET_LAYERS, _PP_DRAFT_LAYER]
+    decode = _make_pp_attn_worker("decode", layers, hma=False, layout=layout, mla=True)
+    stages = [
+        _make_pp_attn_worker(
+            "prefill",
+            stage_layers,
+            hma=False,
+            layout=layout,
+            mla=True,
+            pp_stage=(pp_rank, 2),
+        )
+        for pp_rank, stage_layers in enumerate([layers[:2], layers[2:]])
+    ]
+    assert decode.num_regions == 1
+    assert decode.region_members == [layers]
+    assert [stage.region_members for stage in stages] == [
+        [[name] for name in layers[:2]],
+        [[name] for name in layers[2:]],
+    ]
+    row_descs = decode.src_blocks_data.tolist()
+
+    local_block_ids, remote_block_ids = ([1, 5],), ([2, 6],)
+    pairs = _pull_page_pairs(decode, stages, local_block_ids, remote_block_ids)
+    assert pairs == _expected_page_pairs(
+        decode, stages, local_block_ids, remote_block_ids
+    )
+    assert decode._layer_pages is not None
+    assert decode._layer_pages.block_lens == [decode.block_len_per_layer[0] // 5] * 5
+    assert decode.src_blocks_data.tolist() == row_descs
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("p_num_blocks, d_num_blocks", [(4, 4), (4, 6), (6, 4)])
+def test_pull_from_packed_mla_pp_stage_pairs_asymmetric_rows_and_overlays(
+    p_num_blocks, d_num_blocks
+):
+    # Different cache groups overlay pages of different sizes at the same
+    # address, and PP changes both the placement and the stride of the pages
+    # the decoder holds in its rows.
+    stage, p_raw = _make_packed_mla_view_worker(
+        {"L2": (0, 128), "L2.swa": (0, 64), "L3": (128, 64)},
+        192,
+        num_blocks=p_num_blocks,
+        pp_size=2,
+        worker_cls=NixlPullConnectorWorker,
+    )
+    decode, d_raw = _make_packed_mla_view_worker(
+        {"L2": (128, 128), "L2.swa": (0, 64), "L3": (64, 64), "L0": (0, 128)},
+        256,
+        num_blocks=d_num_blocks,
+        worker_cls=NixlPullConnectorWorker,
+    )
+    assert stage.region_members == [["L2"], ["L2.swa"], ["L3"]]
+    assert decode.num_regions == 1
+    metadata = msgspec.msgpack.decode(
+        stage.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    decode.add_remote_agent(
+        metadata,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        remote_pp_rank=1,
+        remote_pp_size=2,
+    )
+    remote_stage = decode._remote_stages[stage.engine_id][1]
+    local_pages = remote_stage.local_pages
+    assert local_pages is not None
+    # Pages of the row's members, in region order: L0, L2, L2.swa, L3.
+    assert local_pages.block_lens == [128, 128, 64, 64]
+    assert local_pages.block_strides == [256] * 4
+    pairs = remote_stage.pairs
+
+    local_ids = decode._compute_desc_ids(
+        [[1], [2], [3], []],
+        decode.num_blocks,
+        None,
+        1,
+        region_num_blocks=local_pages.region_num_blocks,
+        pairs=(pairs.local, pairs.group),
+    )
+    local_descs = decode.nixl_wrapper.dlists[local_pages.xfer_handle]
+    assert len(local_descs) == 4 * d_num_blocks
+    assert local_descs[local_ids].tolist() == [
+        [d_raw.data_ptr() + 128 + 256, 128, 0],
+        [d_raw.data_ptr() + 2 * 256, 64, 0],
+        [d_raw.data_ptr() + 64 + 3 * 256, 64, 0],
+    ]
+    remote_ids = decode._compute_desc_ids(
+        [[3], [1], [2], []],
+        metadata.num_blocks,
+        None,
+        1,
+        region_num_blocks=remote_stage.region_num_blocks,
+        pairs=(pairs.remote, pairs.group),
+    )
+    remote_descs = decode.nixl_wrapper.dlists[remote_stage.xfer_side_handles[0]]
+    assert len(remote_descs) == 3 * p_num_blocks
+    assert remote_descs[remote_ids].tolist() == [
+        [p_raw.data_ptr() + 3 * 192, 128, 0],
+        [p_raw.data_ptr() + 192, 64, 0],
+        [p_raw.data_ptr() + 128 + 2 * 192, 64, 0],
+    ]
 
 
 @pytest.mark.cpu_test

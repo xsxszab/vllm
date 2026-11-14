@@ -449,6 +449,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # Read every stage of the remote rank; each holds a slice of the
             # layers when the remote is pipeline-parallel.
             for stage in stages.values():
+                # A stage paired with per-layer views of packed local rows
+                # reads through their own descriptor list.
+                local_pages = stage.local_pages
                 # Once a read routes the request to failure reporting, the
                 # scheduler may free and reuse its blocks, so no sibling READs
                 # may be posted (and P must not be notified).
@@ -457,7 +460,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     request_id=req_id,
                     dst_engine_id=engine_id,
                     remote_request_id=meta.remote.request_id,
-                    local_xfer_side_handle=local_xfer_side_handle,
+                    local_xfer_side_handle=local_xfer_side_handle
+                    if local_pages is None
+                    else local_pages.xfer_handle,
                     local_dram_handle=local_dram_handle,
                     remote_xfer_side_handle=stage.xfer_side_handles[spec.remote_rank],
                     expected_consumers=plan.local_consumers,
@@ -467,6 +472,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_agent=self._remote_agents[engine_id][
                         (stage.pp_rank, spec.remote_rank)
                     ],
+                    local_region_num_blocks=None
+                    if local_pages is None
+                    else local_pages.region_num_blocks,
                 ):
                     return
 
@@ -509,12 +517,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         region_pairs: _RegionPairs,
         remote_region_num_blocks: list[int],
         remote_agent: str,
+        local_region_num_blocks: list[int] | None = None,
     ) -> bool:
         """Post a READ point-to-point xfer request from a single local worker to
         a single remote worker.
 
         The caller resolves the remote region mapping, block counts and
-        notification agent.
+        notification agent, and the local block counts when the local regions
+        are not the registered ones.
 
         Returns True when the read was posted (or was unnecessary), False
         when the request was routed to failure reporting — the caller must
@@ -615,7 +625,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=self.region_num_blocks or None,
+            region_num_blocks=local_region_num_blocks or self.region_num_blocks or None,
             pairs=(pairs.local, pairs.local if by_region else pairs.group),
         )
 

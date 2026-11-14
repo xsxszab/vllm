@@ -125,8 +125,8 @@ Current pull PP limitations:
 
 - Only P can use PP; D must run with `PP=1`.
 - Hybrid SSM/Mamba models, DCP and mixed-memory KV caches are not supported.
-- Attention-only hybrid cache groups are supported. MLA and CSA-linear combinations that require HMA are currently rejected; other MLA/CSA combinations have not been validated for pull PP. The HMA setting alone does not determine the physical cache layout or whether hybrid allocation is required.
-- Block-outermost packed layouts (`BLHNC` / `BHLNC`) on either endpoint are unsupported, whether HMA is enabled or disabled. A packed PP producer is rejected at initialization; a PP1 consumer can only reject a packed PP peer once its metadata is known. Use a non-packed layout supported by the attention backend, or check the separate push restrictions below. Sharing an allocation between HMA cache groups does not by itself make a layout packed.
+- Hybrid cache groups are supported for attention, MLA and CSA-linear caches (e.g. DeepSeek-V4-Flash, DeepSeek-V4.1-Flash).
+- Block-outermost packed layouts (`BLHNC` / `BHLNC`) on either endpoint require MLA caches and the same block size on P and D. A packed PP stage registers each layer's page as a region, and a packed D reads each page into its place in the local block row, so a block takes one descriptor per layer page instead of one per row. A non-MLA packed PP stage is rejected at cache registration; a PP1 consumer rejects a non-MLA packed PP peer once its metadata is known.
 - P and D must put each layer in the same KV cache group.
 
 Current push PP + HMA limitations:

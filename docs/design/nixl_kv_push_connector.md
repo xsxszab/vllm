@@ -239,15 +239,18 @@ P (stage 2), block b: | L3 | L4 | L5 |
 ```
 
 `PP=1` packed MLA peers transfer whole rows. They also advertise where each layer's page
-sits in the row (`NixlAgentMetadata.packed_member_layouts`). A PP **push** producer
-registers one region per layer, so it views each of D's rows as one region per
-layer and pairs its pages with those. Page sizes must match; offsets, row
-strides, and block counts may differ. Because PP stages can list the same
-attention backends in a different order, packed push compares the sorted set of
-backend names during the handshake. Pull does not split PP stages' packed rows
-this way. Packed pull PP is rejected on either endpoint, independently of HMA;
-other packed combinations, including dense views that can register strided
-per-layer regions, remain unvalidated for pull PP.
+sits in the row (`NixlAgentMetadata.packed_member_layouts`). A packed PP stage,
+push or pull, registers one region per layer page. A **push** stage views each
+of D's rows as one region per layer and pairs its pages with those. A **pull**
+D keeps its whole-row regions for PP=1 peers; on the first pairing with a PP
+stage it views its own rows as one region per layer page, with a descriptor
+list of its own, and reads each stage page into its place in the local row.
+Page sizes must match; offsets, row strides, and block counts may differ. A
+block then takes one descriptor per layer page instead of one per row. Packed
+PP requires MLA caches, whose pages are whole on every TP rank, and pull also
+requires the same block size on P and D. Because PP stages can list the same
+attention backends in a different order, packed push compares the sorted set
+of backend names during the handshake.
 
 Invariants enforced when pairing:
 

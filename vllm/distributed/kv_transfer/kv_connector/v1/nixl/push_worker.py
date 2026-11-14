@@ -47,6 +47,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
+    _LayerPageRegions,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
@@ -175,9 +176,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_tp_size: int,
         remote_dcp_size: int = 1,
         local_region_ids: Sequence[int] | None = None,
+        local_pages: _LayerPageRegions | None = None,
     ) -> None:
         super()._validate_remote_agent_handshake(
-            nixl_agent_meta, remote_tp_size, remote_dcp_size, local_region_ids
+            nixl_agent_meta,
+            remote_tp_size,
+            remote_dcp_size,
+            local_region_ids,
+            local_pages,
         )
         assert self.transfer_topo is not None
         if (
