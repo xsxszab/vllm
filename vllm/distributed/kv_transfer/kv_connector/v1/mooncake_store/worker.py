@@ -2451,6 +2451,9 @@ class MooncakeStoreWorker:
         self._loading_req_ids -= popped
         return popped
 
+    def has_pending_recving(self) -> bool:
+        return bool(self._loading_req_ids)
+
     def poll_finished_recving(self) -> set[str]:
         """Pop the loads that finished without errors.
 
@@ -2458,7 +2461,7 @@ class MooncakeStoreWorker:
         in the same step output as, or after, their invalid block ids or
         failed requests.
         """
-        if not self._loading_req_ids:
+        if not self.has_pending_recving():
             return set()
         return self._pop_finished_loads(with_errors=False)
 

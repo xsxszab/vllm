@@ -369,14 +369,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
-        # With sync scheduling, report KV loads that finished early also at the
-        # end of each step (`KVTransferConfig.enable_early_recv`).
-        kv_transfer_config = vllm_config.kv_transfer_config
-        self._report_early_recv_at_step_end = bool(
-            kv_transfer_config is not None
-            and kv_transfer_config.enable_early_recv
-            and not self.scheduler_config.async_scheduling
-        )
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
@@ -2342,6 +2334,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             pending_aux_output=pending_aux_output,
             num_drafted_tokens_per_req=num_drafted_tokens_per_req,
             num_verified_tokens_per_req=num_verified_tokens_per_req,
+            # With sync scheduling the engine schedules as soon as it gets this
+            # output: report loads that finished while the GPU ran this step.
+            on_ready=(
+                None
+                if self.scheduler_config.async_scheduling
+                else self.kv_connector.report_early_finished_recving
+            ),
         )
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
@@ -2434,11 +2433,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
 
-        if self._report_early_recv_at_step_end:
-            # The engine schedules as soon as it gets this output: report the
-            # loads that finished while the GPU ran this step.
-            async_output.copy_event.synchronize()
-            self.kv_connector.report_early_recving()
         return async_output
 
     def _get_num_drafted_and_verified(

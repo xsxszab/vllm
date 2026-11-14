@@ -1227,10 +1227,18 @@ class WorkerProc:
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers."""
-        assert self.rpc_broadcast_mq is not None
+        mq = self.rpc_broadcast_mq
+        assert mq is not None
         while True:
+            # Do the worker's idle work while no RPC is queued.
+            while (deadline := self.worker.idle_work_deadline()) is not None:
+                mq.spin_until_readable((), deadline)
+                if mq.shutting_down or mq.readable():
+                    break
+                get_watch_dog().feed()
+                self.worker.run_idle_work()
             with get_watch_dog().disable():
-                rpc_request = self.rpc_broadcast_mq.dequeue(indefinite=True)
+                rpc_request = mq.dequeue(indefinite=True)
             self._execute_worker_rpc(rpc_request)
             del rpc_request
 

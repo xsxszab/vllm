@@ -9,6 +9,12 @@ import torch.nn as nn
 
 import vllm.ir
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+    next_early_recv_poll,
+    poll_early_finished_recving,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_backends
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -147,6 +153,18 @@ class WorkerBase:
     def check_health(self) -> None:
         """Basic health check (override for device-specific checks)."""
         return
+
+    def idle_work_deadline(self) -> float | None:
+        """`time.monotonic()` deadline for `run_idle_work()` while the worker
+        waits for its next RPC, or None to just wait for the RPC."""
+        if not has_kv_transfer_group():
+            return None
+        return next_early_recv_poll(get_kv_transfer_group())
+
+    def run_idle_work(self) -> None:
+        """Work done while waiting for the next RPC: report KV loads that
+        finished early (`KVTransferConfig.enable_early_recv`)."""
+        poll_early_finished_recving(get_kv_transfer_group())
 
     def synchronize_device(self) -> None:
         """Block until in-flight device work completes; backends outside

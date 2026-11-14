@@ -436,6 +436,9 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                         self._extra_async_saves[req_id] = extra_pending - 1
         return results
 
+    def has_pending_recving(self) -> bool:
+        return any(c.has_pending_recving() for c in self._connectors)
+
     def poll_finished_recving(self) -> set[str]:
         finished_recving: set[str] = set()
         for c in self._connectors:

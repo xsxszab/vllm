@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import subprocess
 import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import zmq
 
+from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.utils.network_utils import get_open_zmq_ipc_path, make_zmq_socket
 from vllm.v1.executor.early_kv_recv import EarlyKVOutputAggregator
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
@@ -30,6 +35,44 @@ with suppress(Exception):
     )
     assert result.returncode == 1
     assert "Early KV receive poll failed" in result.stdout + result.stderr
+
+
+def test_idle_polling_follows_steps_and_pending_loads(monkeypatch: pytest.MonkeyPatch):
+    """A worker waiting for its next step polls only while loads are pending
+    and a step ran recently; every report or poll sends what finished."""
+    now = [100.0]
+    monkeypatch.setattr(
+        kv_transfer_state, "time", SimpleNamespace(monotonic=lambda: now[0])
+    )
+    connector = Mock()
+    connector.has_pending_recving.return_value = True
+    connector.poll_finished_recving.return_value = {"request"}
+    path = get_open_zmq_ipc_path()
+    engine_end = make_zmq_socket(zmq.Context.instance(), path, zmq.PULL)
+    kv_transfer_state.init_early_recv_reporting(path)
+
+    def received() -> set[str]:
+        assert engine_end.poll(timeout=5000)
+        return engine_end.recv_pyobj()
+
+    try:
+        # No step has run yet.
+        assert kv_transfer_state.next_early_recv_poll(connector) is None
+        kv_transfer_state.report_early_finished_recving(connector)
+        assert received() == {"request"}
+        deadline = kv_transfer_state.next_early_recv_poll(connector)
+        assert deadline is not None and deadline > now[0]
+        kv_transfer_state.poll_early_finished_recving(connector)
+        assert received() == {"request"}
+        connector.has_pending_recving.return_value = False
+        assert kv_transfer_state.next_early_recv_poll(connector) is None
+        connector.has_pending_recving.return_value = True
+        # No step for longer than the active window: the engine is idle.
+        now[0] += 2.0
+        assert kv_transfer_state.next_early_recv_poll(connector) is None
+    finally:
+        kv_transfer_state.ensure_kv_transfer_shutdown()
+        engine_end.close(linger=0)
 
 
 @pytest.mark.parametrize(

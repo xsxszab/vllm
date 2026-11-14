@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -22,6 +23,12 @@ if TYPE_CHECKING:
 _KV_CONNECTOR_AGENT: KVConnectorBaseType | None = None
 # Worker end of the engine's early receive channel (multiprocessing executor).
 _EARLY_RECV_SOCKET: zmq.Socket | None = None
+# Interval between polls while a worker waits for its next step.
+_EARLY_RECV_POLL_INTERVAL_S = 0.0002
+# Without a step for this long the engine is idle or paused: stop polling.
+_EARLY_RECV_ACTIVE_WINDOW_S = 1.0
+_early_recv_last_step = 0.0
+_early_recv_next_poll = 0.0
 
 logger = init_logger(__name__)
 
@@ -102,8 +109,9 @@ def ensure_kv_transfer_initialized(
 
 def init_early_recv_reporting(path: str) -> None:
     """Report KV loads that finish early to the engine over the channel at `path`."""
-    global _EARLY_RECV_SOCKET
+    global _EARLY_RECV_SOCKET, _early_recv_last_step, _early_recv_next_poll
     _EARLY_RECV_SOCKET = make_zmq_socket(zmq.Context.instance(), path, zmq.PUSH)
+    _early_recv_last_step = _early_recv_next_poll = 0.0
 
 
 def report_early_finished_recving(connector: KVConnectorBase_V1) -> None:
@@ -112,8 +120,33 @@ def report_early_finished_recving(connector: KVConnectorBase_V1) -> None:
     Called by the model runner during each step. A no-op unless
     `init_early_recv_reporting()` was called in this process.
     """
+    global _early_recv_last_step
     if _EARLY_RECV_SOCKET is None:
         return
+    _early_recv_last_step = time.monotonic()
+    _send_early_finished_recving(connector)
+
+
+def next_early_recv_poll(connector: KVConnectorBase_V1) -> float | None:
+    """`time.monotonic()` deadline of the next poll while the worker waits for
+    its next step, or None when there is nothing to poll for."""
+    if (
+        _EARLY_RECV_SOCKET is None
+        or time.monotonic() - _early_recv_last_step > _EARLY_RECV_ACTIVE_WINDOW_S
+        or not connector.has_pending_recving()
+    ):
+        return None
+    return _early_recv_next_poll
+
+
+def poll_early_finished_recving(connector: KVConnectorBase_V1) -> None:
+    """Poll while the worker waits for its next step; see `next_early_recv_poll()`."""
+    _send_early_finished_recving(connector)
+
+
+def _send_early_finished_recving(connector: KVConnectorBase_V1) -> None:
+    global _early_recv_next_poll
+    assert _EARLY_RECV_SOCKET is not None
     try:
         with torch.inference_mode():
             req_ids = connector.poll_finished_recving()
@@ -125,6 +158,9 @@ def report_early_finished_recving(connector: KVConnectorBase_V1) -> None:
         # tolerance retry can complete these loads; the worker monitor stops
         # the engine.
         os._exit(1)
+    finally:
+        # Measured from the end of a poll, so long polls do not run back to back.
+        _early_recv_next_poll = time.monotonic() + _EARLY_RECV_POLL_INTERVAL_S
 
 
 def ensure_kv_transfer_shutdown() -> None:

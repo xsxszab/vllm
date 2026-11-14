@@ -9,7 +9,6 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
     kv_transfer_state,
-    report_early_finished_recving,
 )
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.forward_context import (
@@ -50,7 +49,7 @@ class KVConnector:
     def finalize_step(self) -> None:
         pass
 
-    def report_early_recving(self) -> None:
+    def report_early_finished_recving(self) -> None:
         """Send KV loads that finished early to the engine (`enable_early_recv`)."""
         pass
 
@@ -152,7 +151,7 @@ class ActiveKVConnector(KVConnector):
             self.kv_connector.wait_for_save()
         transfer_results = self.kv_connector.get_transfer_results(finished_req_ids)
         # Loads that finished without errors go out now, ahead of this output.
-        self.report_early_recving()
+        self.report_early_finished_recving()
         output.finished_sending = transfer_results.finished_sending or None
         output.finished_recving = transfer_results.finished_recving or None
         output.failed_recving = transfer_results.failed_recving
@@ -172,9 +171,9 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.wait_for_save()
         self.kv_connector.clear_connector_metadata()
 
-    def report_early_recving(self) -> None:
+    def report_early_finished_recving(self) -> None:
         if not self._disabled:
-            report_early_finished_recving(self.kv_connector)
+            kv_transfer_state.report_early_finished_recving(self.kv_connector)
 
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         if self._disabled:
