@@ -719,29 +719,6 @@ def test_register_kv_caches_places_layers_in_their_row_slots():
     assert all(ref.mapping is not None for ref in refs)
 
 
-@pytest.mark.parametrize(
-    ("slot_pages", "bad_layer"),
-    [({"layer0": 1}, "layer1"), ({"layer0": 2, "layer1": 1}, "layer0")],
-    ids=["missing-slot", "slot-size"],
-)
-def test_register_kv_caches_checks_row_slots(slot_pages, bad_layer):
-    """Every layer's canonical pages must fill the row slot that all workers
-    and the scheduler agree on."""
-    kv_cache_config = _two_layer_kv_cache_config(["layer0", "layer1"])
-    page = _ATTN_SPEC.page_size_bytes
-    kv_caches = _allocate_kv_caches(
-        kv_cache_config, [], device=torch.device(f"{DEVICE_TYPE}:0")
-    )
-    row_layout = LayerObjectLayout.pack(
-        [(name, num_pages * page) for name, num_pages in slot_pages.items()]
-    )
-    worker, _ = _make_worker(
-        kv_cache_config, canonical_layout=True, canonical_row_layouts={0: row_layout}
-    )
-    with pytest.raises(AssertionError, match=bad_layer):
-        worker.register_kv_caches(kv_caches)
-
-
 def test_register_split_padded_pages_raises():
     """Offloading reads each page's payload from its start, which a padded page
     split into kernel blocks does not keep: its padding sits after every

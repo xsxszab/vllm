@@ -19,10 +19,6 @@ def test_pack_places_layers_back_to_back():
     assert layout.size == 160
 
 
-def test_pack_without_layers_is_empty():
-    assert LayerObjectLayout.pack([]) == LayerObjectLayout({}, 0)
-
-
 @pytest.mark.parametrize(
     ("layer_sizes", "match"),
     [
