@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayerConfig,
     KVCacheLayout,
     KVCacheSpec,
+    KVCacheStage,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
@@ -1430,6 +1431,55 @@ def _project_kv_cache_groups_to_worker(
             )
         )
     return projected_groups
+
+
+def get_pipeline_stages(
+    layer_configs: list[dict[str, KVCacheLayerConfig]],
+    kv_cache_configs: list[KVCacheConfig],
+    pipeline_parallel_size: int,
+) -> tuple[KVCacheStage, ...]:
+    """The KV cache layers of every pipeline stage.
+
+    Workers are ordered by PP rank, then by PCP and TP rank, and every worker
+    of a stage holds the same layers, so the first worker of each stage
+    describes it.
+
+    Args:
+        layer_configs: The KV cache layer configs of each worker.
+        kv_cache_configs: The KV cache config of each worker.
+        pipeline_parallel_size: The number of pipeline stages.
+
+    Returns:
+        One `KVCacheStage` per PP rank, or an empty tuple when the workers do
+        not split evenly into the stages.
+
+    """
+    num_workers = len(layer_configs)
+    if num_workers == 0 or num_workers % pipeline_parallel_size:
+        return ()
+    workers_per_stage = num_workers // pipeline_parallel_size
+    stages: list[KVCacheStage] = []
+    for first in range(0, num_workers, workers_per_stage):
+        layers = layer_configs[first]
+        assert all(
+            layer_configs[worker].keys() == layers.keys()
+            for worker in range(first, first + workers_per_stage)
+        ), "Workers of one pipeline stage must hold the same KV cache layers."
+        stages.append(
+            KVCacheStage(
+                layer_names=tuple(layers),
+                # Workers add KV-sharing layers to their own groups in place, so
+                # the stage keeps copies.
+                kv_cache_groups=tuple(
+                    replace(group, kv_cache_specs=dict(group.kv_cache_specs))
+                    for group in kv_cache_configs[first].kv_cache_groups
+                ),
+                draft_layer_names=frozenset(
+                    name for name, config in layers.items() if config.is_draft
+                ),
+            )
+        )
+    return tuple(stages)
 
 
 def get_kv_cache_configs(

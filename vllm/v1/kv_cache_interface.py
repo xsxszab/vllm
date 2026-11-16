@@ -839,6 +839,21 @@ def prefix_lookup_groups(
     return list(lookups.values())
 
 
+@dataclass(frozen=True, slots=True)
+class KVCacheStage:
+    """The KV cache layers of one pipeline stage."""
+
+    layer_names: tuple[str, ...]
+    """The stage's KV cache layers, in model order."""
+
+    kv_cache_groups: tuple[KVCacheGroup, ...]
+    """The global KV cache groups projected onto the stage, by group ID. A
+    group holding no layer of the stage is kept with no layers."""
+
+    draft_layer_names: frozenset[str] = frozenset()
+    """The stage's layers that belong to a draft model."""
+
+
 @dataclass
 class KVCacheConfig:
     """The KV cache configuration of a model."""
@@ -874,6 +889,11 @@ class KVCacheConfig:
 
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
+
+    pipeline_stages: tuple[KVCacheStage, ...] = field(default=(), compare=False)
+    """The KV cache layers of every pipeline stage, by PP rank, resolved by the
+    engine core so that both halves of a KV connector see every stage. Empty
+    when the stages are unknown."""
 
     needs_kv_cache_zeroing: bool = field(init=False)
     """Whether newly allocated attention blocks must be zeroed before use.
