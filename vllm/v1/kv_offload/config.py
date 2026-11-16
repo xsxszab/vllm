@@ -3,7 +3,7 @@
 """Normalized configuration consumed by native offloading backends."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -91,5 +91,13 @@ class OffloadingConfig:
     # True when the canonical per-layer host byte layout was requested via
     # kv_connector_extra_config; certified per-layer at worker registration.
     canonical_layout: bool = False
+    # Canonical layout: the byte offset of each layer's pages within a chunk
+    # row, for the layers of every offloaded group on every pipeline stage. A
+    # row holds one group's layers back to back in model order, so a stage
+    # writes its own layers' slots and the offsets do not depend on the
+    # parallel config.
+    canonical_layer_offsets: Mapping[str, int] = field(default_factory=dict)
+    # Canonical layout: bytes of a chunk row, set by the largest group.
+    canonical_row_bytes: int = 0
     # Resolved KVCacheLayout name of the worker KV cache.
     kv_cache_layout: str | None = None

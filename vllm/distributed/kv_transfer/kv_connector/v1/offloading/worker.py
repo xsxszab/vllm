@@ -7,6 +7,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
+    canonical_page_size,
     derive_canonical_mappings,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -79,6 +80,26 @@ class OffloadingConnectorWorker:
         mappings = derive_canonical_mappings(
             self.vllm_config, kv_cache_config, kv_caches
         )
+        canonical_offsets = self.spec.config.canonical_layer_offsets
+        if canonical_offsets:
+            # The scheduler and every worker size a layer's slot in a chunk
+            # row from its spec alone; the mapping derived from this worker's
+            # physical KV cache layout must fit in that slot.
+            for kv_cache_group in selected_groups:
+                for layer_name, spec in kv_cache_group.kv_cache_specs.items():
+                    mapping = mappings.get(layer_name)
+                    slot_page_size = canonical_page_size(self.vllm_config, spec)
+                    if mapping is not None and (
+                        layer_name not in canonical_offsets
+                        or slot_page_size is None
+                        or mapping.canonical_page_size_bytes > slot_page_size
+                    ):
+                        raise RuntimeError(
+                            "canonical_layout could not map the physical KV "
+                            f"cache layout of layer {layer_name} to its "
+                            "canonical page. Remove canonical_layout from "
+                            "kv_connector_extra_config."
+                        )
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
@@ -205,6 +226,7 @@ class OffloadingConnectorWorker:
                             tensor_idx=curr_tensor_idx,
                             page_size_bytes=(unpadded_page_size_bytes[layer_name]),
                             mapping=mapping,
+                            canonical_offset=canonical_offsets.get(layer_name, 0),
                         )
                     )
 

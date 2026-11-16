@@ -36,10 +36,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupRole,
     KVCacheLayerConfig,
     KVCacheSpec,
+    KVCacheStage,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
 )
+from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
@@ -1298,3 +1300,99 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+def _pipeline_kv_cache_configs(stage_layers: list[list[str]]) -> list[KVCacheConfig]:
+    """The KV cache config of each pipeline stage, as the engine core resolves
+    it: the stage's own layers, and the layers of every stage."""
+    spec = _full_attention_spec()
+    page = spec.page_size_bytes
+    num_blocks = 4
+    groups = [make_kv_cache_group(layers, spec) for layers in stage_layers]
+    stages = tuple(
+        KVCacheStage(layer_names=tuple(layers), kv_cache_groups=(group,))
+        for layers, group in zip(stage_layers, groups)
+    )
+    kv_cache_configs = []
+    for layers, group in zip(stage_layers, groups):
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=len(layers) * page * num_blocks,
+                    layers=layers,
+                    layer_stride=page * num_blocks,
+                    block_stride=page,
+                )
+            ],
+            kv_cache_groups=[group],
+        )
+        kv_cache_config.pipeline_stages = stages
+        kv_cache_configs.append(kv_cache_config)
+    return kv_cache_configs
+
+
+def _pipeline_offloading_configs(
+    stage_layers: list[list[str]], extra_config: dict[str, Any]
+) -> list[OffloadingConfig]:
+    """The offloading config of every stage's worker, then the scheduler's."""
+    config = _make_vllm_config(
+        pipeline_parallel_size=len(stage_layers), extra_config=extra_config
+    )
+    config.cache_config.kv_cache_layout = "LBNHC"
+    worker_configs = _pipeline_kv_cache_configs(stage_layers)
+    scheduler_config = generate_scheduler_kv_cache_config(worker_configs)
+    offloading_configs = []
+    for rank, kv_cache_config in [*enumerate(worker_configs), (0, scheduler_config)]:
+        config.parallel_config.rank = rank
+        offloading_configs.append(build_offloading_config(config, kv_cache_config))
+    return offloading_configs
+
+
+@pytest.mark.parametrize(
+    "stage_layers",
+    [[["l0", "l1"], ["l2"]], [["l0"], ["l1", "l2"]], [["l0"], ["l1"], ["l2"]]],
+    ids=["2-1", "1-2", "1-1-1"],
+)
+def test_canonical_rows_do_not_depend_on_pipeline_stages(stage_layers):
+    """A canonical chunk row holds the layers of every stage in model order,
+    so every stage, the scheduler and a single-stage engine agree on the row,
+    the CPU chunk size and the storage namespace."""
+    page = _full_attention_spec().page_size_bytes
+    extra_config = {"canonical_layout": True, "cpu_bytes_to_use": 3 * page * 8}
+    single_stage = _pipeline_offloading_configs([["l0", "l1", "l2"]], extra_config)[0]
+    expected_base_path = FileMapper.from_offloading_spec(
+        "/cache", TieringOffloadingSpec(single_stage), parallel_agnostic=True
+    ).base_path
+
+    for offloading_config in _pipeline_offloading_configs(stage_layers, extra_config):
+        assert offloading_config.groups[0].layer_names == ("l0", "l1", "l2")
+        assert offloading_config.canonical_layer_offsets == {
+            "l0": 0,
+            "l1": page,
+            "l2": 2 * page,
+        }
+        assert offloading_config.canonical_row_bytes == 3 * page
+        assert offloading_config.parallel.is_parallelism_agnostic
+        spec = TieringOffloadingSpec(offloading_config)
+        assert spec.kv_bytes_per_chunk == 3 * page
+        assert spec.num_chunks == 8
+        mapper = FileMapper.from_offloading_spec("/cache", spec, parallel_agnostic=True)
+        assert mapper.base_path == expected_base_path
+
+
+def test_direct_layout_names_the_stage_layers():
+    """Without the canonical layout a worker stores only its stage's pages,
+    so the namespace keeps the stage's own layers."""
+    offloading_configs = _pipeline_offloading_configs(
+        [["l0", "l1"], ["l2"]], {"cpu_bytes_to_use": 1 << 20}
+    )
+    assert [config.groups[0].layer_names for config in offloading_configs] == [
+        ("l0", "l1"),
+        ("l2",),
+        ("l0", "l1"),
+    ]
+    assert all(not config.canonical_layer_offsets for config in offloading_configs)
+    assert not any(
+        config.parallel.is_parallelism_agnostic for config in offloading_configs
+    )
