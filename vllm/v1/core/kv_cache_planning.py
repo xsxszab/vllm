@@ -1434,7 +1434,6 @@ def _project_kv_cache_groups_to_worker(
 
 
 def get_pipeline_stages(
-    layer_configs: list[dict[str, KVCacheLayerConfig]],
     kv_cache_configs: list[KVCacheConfig],
     pipeline_parallel_size: int,
 ) -> tuple[KVCacheStage, ...]:
@@ -1445,7 +1444,6 @@ def get_pipeline_stages(
     describes it.
 
     Args:
-        layer_configs: The KV cache layer configs of each worker.
         kv_cache_configs: The KV cache config of each worker.
         pipeline_parallel_size: The number of pipeline stages.
 
@@ -1454,29 +1452,27 @@ def get_pipeline_stages(
         not split evenly into the stages.
 
     """
-    num_workers = len(layer_configs)
+    num_workers = len(kv_cache_configs)
     if num_workers == 0 or num_workers % pipeline_parallel_size:
         return ()
     workers_per_stage = num_workers // pipeline_parallel_size
     stages: list[KVCacheStage] = []
     for first in range(0, num_workers, workers_per_stage):
-        layers = layer_configs[first]
+        groups = kv_cache_configs[first].kv_cache_groups
         assert all(
-            layer_configs[worker].keys() == layers.keys()
+            [g.layer_names for g in kv_cache_configs[worker].kv_cache_groups]
+            == [g.layer_names for g in groups]
             for worker in range(first, first + workers_per_stage)
         ), "Workers of one pipeline stage must hold the same KV cache layers."
+        # A model runner adds KV-sharing layers to the groups of its own copy
+        # of the config in place; the stage keeps groups of its own, so every
+        # worker and the scheduler see the same stages.
         stages.append(
             KVCacheStage(
-                layer_names=tuple(layers),
-                # Workers add KV-sharing layers to their own groups in place, so
-                # the stage keeps copies.
                 kv_cache_groups=tuple(
                     replace(group, kv_cache_specs=dict(group.kv_cache_specs))
-                    for group in kv_cache_configs[first].kv_cache_groups
-                ),
-                draft_layer_names=frozenset(
-                    name for name, config in layers.items() if config.is_draft
-                ),
+                    for group in groups
+                )
             )
         )
     return tuple(stages)

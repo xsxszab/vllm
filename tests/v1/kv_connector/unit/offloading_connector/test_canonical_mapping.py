@@ -567,9 +567,6 @@ def _stage_kv_cache_config(partition: list[int], stage: int) -> KVCacheConfig:
     bounds = [sum(partition[:i]) for i in range(len(partition) + 1)]
     stages = tuple(
         KVCacheStage(
-            layer_names=tuple(
-                f"{kind}.{i}" for i in range(start, end) for kind in ("attn", "mla")
-            ),
             kv_cache_groups=(
                 make_kv_cache_group(
                     [f"attn.{i}" for i in range(start, end)], _full_spec()
@@ -626,3 +623,40 @@ def test_uncertifiable_layer_gets_its_opaque_page_slot():
     spec = _full_spec(kv_quant_mode=KVQuantMode.FP8_PER_TOKEN_HEAD)
     vllm_config = _vllm_config(tp=4, total_kv_heads=8)
     assert canonical_page_size(vllm_config, spec) == 4 * spec.unpadded_page_size_bytes
+
+
+def test_unrecognized_layout_of_certified_layer_fills_its_canonical_page():
+    """Kernel blocks split the page, so its byte layout is not recognized,
+    but the spec's KV head shards are: every rank's page goes whole to its
+    head shard's position, and the page keeps the size of its row slot."""
+    spec = _full_spec(num_kv_heads=1)
+    kv_cache_config = _kv_cache_config([make_kv_cache_group(["attn"], spec)])
+    kernel_blocks = torch.zeros(
+        2 * NUM_BLOCKS, 2, spec.block_size // 2, 1, 64, dtype=torch.int8
+    )
+    vllm_config = _vllm_config(tp=4, total_kv_heads=2)
+    per_rank = []
+    for rank in range(4):
+        vllm_config.parallel_config.rank = rank
+        mappings = derive_canonical_mappings(
+            vllm_config, kv_cache_config, {"attn": kernel_blocks}
+        )
+        per_rank.append(mappings["attn"])
+
+    page = spec.real_page_size_bytes
+    assert canonical_page_size(vllm_config, spec) == 2 * page
+    assert all(m.canonical_page_size_bytes == 2 * page for m in per_rank)
+    assert [_triples(m.runs) for m in per_rank] == [
+        [(0, 0, page)],
+        [(0, 0, page)],
+        [(0, page, page)],
+        [(0, page, page)],
+    ]
+    # The two ranks holding a head take turns writing it
+    assert [(m.num_writers, m.writer_index) for m in per_rank] == [
+        (2, 0),
+        (2, 1),
+        (2, 0),
+        (2, 1),
+    ]
+    assert not any(m.parallelism_agnostic for m in per_rank)

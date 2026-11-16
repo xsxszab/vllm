@@ -5,10 +5,12 @@
 The only place in the offloading stack that reasons about parallelism
 (TP/DCP/PCP/PP); everything downstream consumes byte mappings. The canonical
 page of a layer is the full offloaded block without parallelism: all KV
-heads, all block_size * dcp * pcp tokens, in the worker's page encoding.
-Uncertifiable layers get an opaque fallback mapping (fail closed). A chunk
-row holds one KV cache group's canonical pages, layer by layer in model
-order, so each pipeline stage fills the slots of its own layers.
+heads, all block_size * dcp * pcp tokens, in the worker's page encoding. A
+certified layer whose physical page layout is not recognized places its pages
+whole by KV head shard; uncertifiable layers get an opaque fallback mapping
+(fail closed). A chunk row holds one KV cache group's canonical pages, layer
+by layer in model order, so each pipeline stage fills the slots of its own
+layers.
 """
 
 from collections.abc import Iterable
@@ -364,6 +366,29 @@ def _layer_mapping(
     )
 
 
+def _head_shard_fallback_mapping(
+    spec: AttentionSpec, ctx: _RankContext
+) -> CanonicalPageMapping:
+    """Fallback for a certified attention layer whose physical page layout is
+    not recognized: place the rank's page whole at the position of its KV head
+    shard and CP rank, so it fills the certified canonical page size. Ranks
+    holding the same heads and tokens take turns writing it."""
+    shards = _head_shards(spec, ctx)
+    assert shards is not None
+    num_head_shards, replication = shards
+    page = spec.real_page_size_bytes
+    position = (ctx.tp_rank // replication) * ctx.cp_size + ctx.total_cp_rank
+    run = CopyRun(0, position * page, page, 1, page, page)
+    return CanonicalPageMapping(
+        canonical_page_size_bytes=ctx.cp_size * num_head_shards * page,
+        local_page_size_bytes=page,
+        runs=(run,),
+        num_writers=replication // ctx.dcp_size,
+        writer_index=(ctx.tp_rank % replication) // ctx.dcp_size,
+        parallelism_agnostic=False,
+    )
+
+
 def _opaque_fallback_mapping(
     page_size_bytes: int, num_ranks: int, rank: int
 ) -> CanonicalPageMapping:
@@ -447,9 +472,9 @@ def _rank_context(vllm_config: "VllmConfig", rank: int) -> _RankContext:
 
 
 def canonical_page_size(vllm_config: "VllmConfig", spec: KVCacheSpec) -> int | None:
-    """Canonical page size of a layer, from its spec alone: what the
-    certified mapping or the opaque fallback of `derive_canonical_mappings`
-    gives it. None for a layer without a canonical page."""
+    """Canonical page size of a layer, from its spec alone: the size of every
+    mapping `derive_canonical_mappings` gives it, certified or fallback. None
+    for a layer without a canonical page."""
     ctx = _rank_context(vllm_config, rank=0)
     page = _certified_page_size(spec, ctx)
     if page is not None:
@@ -523,13 +548,22 @@ def derive_canonical_mappings(
                     break
                 per_rank.append(mapping)
             if len(per_rank) != group_size:
-                page = _unpadded_page_size(spec)
-                if page is None:
-                    continue
-                per_rank = [
-                    _opaque_fallback_mapping(page, group_size, rank)
-                    for rank in range(group_size)
-                ]
+                if _certified_page_size(spec, ctx(0)) is not None:
+                    # The spec is certified but the physical page layout is
+                    # not: keep the canonical page size its row slot has.
+                    assert isinstance(spec, AttentionSpec)
+                    per_rank = [
+                        _head_shard_fallback_mapping(spec, ctx(rank))
+                        for rank in range(group_size)
+                    ]
+                else:
+                    page = _unpadded_page_size(spec)
+                    if page is None:
+                        continue
+                    per_rank = [
+                        _opaque_fallback_mapping(page, group_size, rank)
+                        for rank in range(group_size)
+                    ]
             _verify_tiling(layer_name, per_rank)
             mappings[layer_name] = per_rank[my_rank]
     return mappings

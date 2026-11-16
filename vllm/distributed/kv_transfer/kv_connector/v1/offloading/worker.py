@@ -7,7 +7,6 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
-    canonical_page_size,
     derive_canonical_mappings,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -80,26 +79,24 @@ class OffloadingConnectorWorker:
         mappings = derive_canonical_mappings(
             self.vllm_config, kv_cache_config, kv_caches
         )
-        canonical_offsets = self.spec.config.canonical_layer_offsets
-        if canonical_offsets:
-            # The scheduler and every worker size a layer's slot in a chunk
-            # row from its spec alone; the mapping derived from this worker's
-            # physical KV cache layout must fit in that slot.
-            for kv_cache_group in selected_groups:
-                for layer_name, spec in kv_cache_group.kv_cache_specs.items():
-                    mapping = mappings.get(layer_name)
-                    slot_page_size = canonical_page_size(self.vllm_config, spec)
-                    if mapping is not None and (
-                        layer_name not in canonical_offsets
-                        or slot_page_size is None
-                        or mapping.canonical_page_size_bytes > slot_page_size
-                    ):
-                        raise RuntimeError(
-                            "canonical_layout could not map the physical KV "
-                            f"cache layout of layer {layer_name} to its "
-                            "canonical page. Remove canonical_layout from "
-                            "kv_connector_extra_config."
-                        )
+        # Canonical layout: each layer's offset in a chunk row of its group
+        canonical_offsets: dict[str, int] = {}
+        blocks_per_chunk = self.spec.config.cache.blocks_per_chunk
+        for group_id, kv_cache_group in zip(selected_group_ids, selected_groups):
+            row_layout = self.spec.config.canonical_row_layouts.get(group_id)
+            if row_layout is None:
+                continue
+            for layer_name in kv_cache_group.layer_names:
+                slot = row_layout.slots.get(layer_name)
+                mapping = mappings.get(layer_name)
+                if slot is None:
+                    assert mapping is None, f"layer {layer_name} has no row slot"
+                    continue
+                assert (
+                    mapping is None
+                    or mapping.canonical_page_size_bytes * blocks_per_chunk == slot.size
+                ), f"canonical pages of layer {layer_name} do not fill its slot"
+                canonical_offsets[layer_name] = slot.offset
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}

@@ -10,6 +10,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     make_kv_cache_group,
     make_kv_cache_group_from_specs,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.layer_layout import LayerObjectLayout
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     TransferJob,
@@ -105,7 +106,7 @@ def _make_worker(
     replicated_layout: bool = False,
     rank: int = 0,
     canonical_layout: bool = False,
-    canonical_layer_offsets: dict[str, int] | None = None,
+    canonical_row_layouts: dict[int, LayerObjectLayout] | None = None,
 ):
     """Create an OffloadingConnectorWorker with mocked dependencies."""
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
@@ -116,7 +117,8 @@ def _make_worker(
     spec.replicated_layout = replicated_layout
     spec.config = MagicMock()
     spec.config.canonical_layout = canonical_layout
-    spec.config.canonical_layer_offsets = canonical_layer_offsets or {}
+    spec.config.canonical_row_layouts = canonical_row_layouts or {}
+    spec.config.cache.blocks_per_chunk = 1
     spec.config.parallel.rank = rank
     spec.get_worker.return_value = MagicMock()
 
@@ -669,14 +671,16 @@ def test_register_packed_kv_caches_skips_scratch_group():
     assert canonical.group_data_refs == [[CanonicalKVCacheRef(0, 2 * page)]]
 
 
+_ATTN_SPEC = AttentionSpec(
+    block_size=BLOCK_SIZE,
+    num_kv_heads=NUM_KV_HEADS,
+    head_size=HEAD_SIZE,
+    dtype=DTYPE,
+)
+
+
 def _two_layer_kv_cache_config(layers: list[str]) -> KVCacheConfig:
-    attn_spec = AttentionSpec(
-        block_size=BLOCK_SIZE,
-        num_kv_heads=NUM_KV_HEADS,
-        head_size=HEAD_SIZE,
-        dtype=DTYPE,
-    )
-    page = attn_spec.page_size_bytes
+    page = _ATTN_SPEC.page_size_bytes
     return KVCacheConfig(
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=[
@@ -687,7 +691,7 @@ def _two_layer_kv_cache_config(layers: list[str]) -> KVCacheConfig:
                 block_stride=page,
             )
         ],
-        kv_cache_groups=[make_kv_cache_group(layers, attn_spec)],
+        kv_cache_groups=[make_kv_cache_group(layers, _ATTN_SPEC)],
     )
 
 
@@ -696,14 +700,16 @@ def test_register_kv_caches_places_layers_in_their_row_slots():
     canonical pages at the slots the row layout of all stages gives them."""
     layers = ["layer2", "layer3"]
     kv_cache_config = _two_layer_kv_cache_config(layers)
-    page = kv_cache_config.kv_cache_groups[0].page_size_bytes
+    page = _ATTN_SPEC.page_size_bytes
     kv_caches = _allocate_kv_caches(
         kv_cache_config, [], device=torch.device(f"{DEVICE_TYPE}:0")
     )
     worker, spec = _make_worker(
         kv_cache_config,
         canonical_layout=True,
-        canonical_layer_offsets={f"layer{i}": i * page for i in range(4)},
+        canonical_row_layouts={
+            0: LayerObjectLayout.pack([(f"layer{i}", page) for i in range(4)])
+        },
     )
     worker.register_kv_caches(kv_caches)
 
@@ -713,17 +719,26 @@ def test_register_kv_caches_places_layers_in_their_row_slots():
     assert all(ref.mapping is not None for ref in refs)
 
 
-def test_register_kv_caches_rejects_layer_without_row_slot():
+@pytest.mark.parametrize(
+    ("slot_pages", "bad_layer"),
+    [({"layer0": 1}, "layer1"), ({"layer0": 2, "layer1": 1}, "layer0")],
+    ids=["missing-slot", "slot-size"],
+)
+def test_register_kv_caches_checks_row_slots(slot_pages, bad_layer):
+    """Every layer's canonical pages must fill the row slot that all workers
+    and the scheduler agree on."""
     kv_cache_config = _two_layer_kv_cache_config(["layer0", "layer1"])
+    page = _ATTN_SPEC.page_size_bytes
     kv_caches = _allocate_kv_caches(
         kv_cache_config, [], device=torch.device(f"{DEVICE_TYPE}:0")
     )
-    worker, _ = _make_worker(
-        kv_cache_config,
-        canonical_layout=True,
-        canonical_layer_offsets={"layer0": 0},
+    row_layout = LayerObjectLayout.pack(
+        [(name, num_pages * page) for name, num_pages in slot_pages.items()]
     )
-    with pytest.raises(RuntimeError, match="layer1"):
+    worker, _ = _make_worker(
+        kv_cache_config, canonical_layout=True, canonical_row_layouts={0: row_layout}
+    )
+    with pytest.raises(AssertionError, match=bad_layer):
         worker.register_kv_caches(kv_caches)
 
 

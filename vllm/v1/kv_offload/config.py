@@ -4,7 +4,12 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.layer_layout import (
+        LayerObjectLayout,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,13 +96,12 @@ class OffloadingConfig:
     # True when the canonical per-layer host byte layout was requested via
     # kv_connector_extra_config; certified per-layer at worker registration.
     canonical_layout: bool = False
-    # Canonical layout: the byte offset of each layer's pages within a chunk
-    # row, for the layers of every offloaded group on every pipeline stage. A
-    # row holds one group's layers back to back in model order, so a stage
-    # writes its own layers' slots and the offsets do not depend on the
-    # parallel config.
-    canonical_layer_offsets: Mapping[str, int] = field(default_factory=dict)
-    # Canonical layout: bytes of a chunk row, set by the largest group.
-    canonical_row_bytes: int = 0
+    # Canonical layout: the layout of a chunk row of each offloaded group, by
+    # group ID. A row holds the canonical pages of the group's layers on every
+    # pipeline stage, back to back in model order, so the layout does not
+    # depend on the parallel config; a stage fills the slots of its own layers.
+    canonical_row_layouts: Mapping[int, "LayerObjectLayout"] = field(
+        default_factory=dict
+    )
     # Resolved KVCacheLayout name of the worker KV cache.
     kv_cache_layout: str | None = None

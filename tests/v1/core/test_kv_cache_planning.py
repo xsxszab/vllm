@@ -685,8 +685,8 @@ def test_project_kv_cache_groups_to_worker():
 
 
 def test_pipeline_stages_describe_every_stage():
-    """Every worker learns each PP stage's layers, draft layers and group
-    projections, which stay fixed when a worker later edits its own groups."""
+    """Every worker learns each PP stage's group projections, which stay fixed
+    when a worker later edits its own groups."""
     layer = new_kv_cache_layer()
     stage0 = {"layer0": layer, "layer1": layer}
     stage1 = {"layer2": layer, "draft.layer0": replace(layer, is_draft=True)}
@@ -696,23 +696,16 @@ def test_pipeline_stages_describe_every_stage():
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     kv_cache_configs = get_kv_cache_configs(vllm_config, layer_configs, [2**30] * 4)
 
-    stages = get_pipeline_stages(layer_configs, kv_cache_configs, 2)
+    stages = get_pipeline_stages(kv_cache_configs, 2)
 
-    assert [stage.layer_names for stage in stages] == [
-        ("layer0", "layer1"),
-        ("layer2", "draft.layer0"),
+    assert [[g.layer_names for g in stage.kv_cache_groups] for stage in stages] == [
+        [g.layer_names for g in kv_cache_configs[worker].kv_cache_groups]
+        for worker in (0, 2)
     ]
-    assert [stage.draft_layer_names for stage in stages] == [
-        frozenset(),
-        {"draft.layer0"},
-    ]
-    for stage, worker in zip(stages, (0, 2)):
-        assert [g.layer_names for g in stage.kv_cache_groups] == [
-            g.layer_names for g in kv_cache_configs[worker].kv_cache_groups
-        ]
+    assert stages[1].kv_cache_groups[0].layer_names == ["layer2", "draft.layer0"]
     kv_cache_configs[2].kv_cache_groups[0].kv_cache_specs["shared"] = layer.spec
     assert stages[1].kv_cache_groups[0].layer_names == ["layer2", "draft.layer0"]
-    assert get_pipeline_stages(layer_configs[:3], kv_cache_configs[:3], 2) == ()
+    assert get_pipeline_stages(kv_cache_configs[:3], 2) == ()
 
 
 @pytest.mark.parametrize("stage_layers", [["other"], ["mixed_mla", "attn1"]])

@@ -843,15 +843,10 @@ def prefix_lookup_groups(
 class KVCacheStage:
     """The KV cache layers of one pipeline stage."""
 
-    layer_names: tuple[str, ...]
-    """The stage's KV cache layers, in model order."""
-
     kv_cache_groups: tuple[KVCacheGroup, ...]
-    """The global KV cache groups projected onto the stage, by group ID. A
-    group holding no layer of the stage is kept with no layers."""
-
-    draft_layer_names: frozenset[str] = frozenset()
-    """The stage's layers that belong to a draft model."""
+    """The global KV cache groups projected onto the stage, by group ID, each
+    holding the stage's layers of the group in model order. A group holding
+    no layer of the stage is kept with no layers."""
 
 
 @dataclass

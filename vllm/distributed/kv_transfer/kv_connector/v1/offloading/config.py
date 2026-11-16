@@ -4,6 +4,9 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.distributed.kv_transfer.kv_connector.v1.layer_layout import (
+    LayerObjectLayout,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     canonical_row_layouts,
 )
@@ -204,8 +207,7 @@ def build_offloading_config(
     # group, qualifies; certification happens per layer at registration and
     # create_worker fails closed on this flag.
     is_parallelism_agnostic = False
-    canonical_layer_offsets: dict[str, int] = {}
-    canonical_row_bytes = 0
+    row_layouts: dict[int, LayerObjectLayout] = {}
     if canonical_layout:
         # Every stage must lay out the chunk row of all stages identically.
         assert (
@@ -261,24 +263,17 @@ def build_offloading_config(
             (group_id for group_id, _ in selected_groups),
             blocks_per_chunk,
         )
-        canonical_layer_offsets = {
-            layer_name: slot.offset
-            for layout in row_layouts.values()
-            for layer_name, slot in layout.slots.items()
-        }
-        # Rows of different groups overlay: a row belongs to one group's key.
-        canonical_row_bytes = max(
-            (layout.size for layout in row_layouts.values()), default=0
-        )
 
     if canonical_layout:
         replicated_layout = (
             is_parallelism_agnostic
             and all(
                 type(spec) is MLAAttentionSpec
-                for group_id, _ in selected_groups
-                for spec in kv_cache_config.pipeline_layer_specs(group_id).values()
+                for _, group in selected_groups
+                for spec in group.kv_cache_specs.values()
             )
+            # Pipeline stages hold different layers, so their bytes differ.
+            and parallel_config.pipeline_parallel_size == 1
             and parallel_config.nnodes_within_dp == 1
             and (
                 parallel_config.world_size == 1
@@ -325,6 +320,5 @@ def build_offloading_config(
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,
         kv_cache_layout=vllm_config.cache_config.kv_cache_layout,
-        canonical_layer_offsets=canonical_layer_offsets,
-        canonical_row_bytes=canonical_row_bytes,
+        canonical_row_layouts=row_layouts,
     )
