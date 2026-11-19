@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import time
 from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
 from tests.v1.core.utils import uniform_spec
+from vllm.distributed.kv_transfer.kv_connector.v1.early_recv import EarlyRecvReporter
 from vllm.v1.kv_cache_interface import KVCacheGroup
 from vllm.v1.metrics.stats import KV_FETCH_STAGES
 from vllm.v1.outputs import (
@@ -257,8 +259,56 @@ def test_inflight_kv_loads_follow_connector_may_load_async(monkeypatch):
     assert late.status == RequestStatus.WAITING
 
 
-@pytest.mark.parametrize("early_recv", [False, True])
-def test_basic_lifecycle(early_recv):
+@pytest.mark.parametrize("abort_after_resume", [False, True])
+def test_early_recv_resumes_request_before_step_output(abort_after_resume):
+    """A load the worker reported early resumes the request in the next
+    schedule(). The step output that reports the same load later is dropped,
+    also once the resumed request was aborted and freed."""
+    vllm_config = create_vllm_config(
+        kv_connector_extra_config={"enable_early_recv": True}
+    )
+    scheduler = create_scheduler(vllm_config)
+    block_size = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        block_size=block_size,
+        num_tokens=int(block_size * 2.5),
+        do_remote_prefill=True,
+    )
+    scheduler.add_request(request)
+    request_id = request.request_id
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    reporter = EarlyRecvReporter(rank=0)
+    reporter.connect(scheduler_output.kv_connector_metadata.early_recv_path)
+    reporter.report([request_id])
+    deadline = time.monotonic() + 10
+    while not scheduler_output.scheduled_new_reqs:
+        assert time.monotonic() < deadline, "early report did not arrive"
+        scheduler.update_from_output(scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT)
+        scheduler_output = scheduler.schedule()
+    reporter.close()
+    assert request.status == RequestStatus.RUNNING
+
+    if abort_after_resume:
+        scheduler.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+        model_runner_output = copy.deepcopy(EMPTY_MODEL_RUNNER_OUTPUT)
+    else:
+        model_runner_output = create_model_runner_output([request])
+    model_runner_output.kv_connector_output = KVConnectorOutput(
+        finished_recving={request_id}
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    if not abort_after_resume:
+        assert request.status == RequestStatus.RUNNING
+        scheduler.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+    assert_scheduler_empty(scheduler)
+
+
+def test_basic_lifecycle():
     """Test lifecycle of a remote prefill."""
     vllm_config = create_vllm_config()
     scheduler = create_scheduler(vllm_config)
@@ -330,9 +380,6 @@ def test_basic_lifecycle(early_recv):
     model_runner_output.kv_connector_output = KVConnectorOutput(
         finished_recving={request_id}
     )
-    if early_recv:
-        scheduler.add_finished_recving({request_id})
-        model_runner_output.kv_connector_output = None
 
     # (2c): update_from_output():
     engine_core_outputs = scheduler.update_from_output(
@@ -832,10 +879,6 @@ def test_kv_fetch_stages_cleared_on_abort():
 
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
     assert _kv_fetch_stages(scheduler) == (0, 0, 0)
-    assert request.request_id in scheduler.requests
-    scheduler.add_finished_recving({request.request_id})
-    scheduler.schedule()
-    assert_scheduler_empty(scheduler)
 
 
 @patch(

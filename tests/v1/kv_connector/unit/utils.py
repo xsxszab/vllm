@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import tempfile
+import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -29,6 +30,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.early_recv import (
+    EarlyRecvReporter,
+    EarlyRecvTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (  # noqa
     ExampleConnector,
@@ -78,6 +83,24 @@ def create_mock_connector() -> Mock:
 
 def maybe_update_block_size(block_size: int) -> int:
     return 64 if current_platform.is_xpu() else block_size
+
+
+def take_early_reports(
+    tracker: EarlyRecvTracker, reporters: Sequence[EarlyRecvReporter]
+) -> set[str]:
+    """Loads `tracker` finished from the reports sent so far. Every reporter
+    reports a marker load last, so its earlier reports have arrived once the
+    marker finishes."""
+    tracker.add_load("marker")
+    for reporter in reporters:
+        reporter.report(["marker"])
+    finished = set[str]()
+    deadline = time.monotonic() + 10
+    while "marker" not in finished:
+        assert time.monotonic() < deadline, "early reports did not arrive"
+        finished |= tracker.take_finished()
+    tracker.update_connector_output(KVConnectorOutput(finished_recving={"marker"}))
+    return finished - {"marker"}
 
 
 def assert_scheduler_empty(scheduler: Scheduler):

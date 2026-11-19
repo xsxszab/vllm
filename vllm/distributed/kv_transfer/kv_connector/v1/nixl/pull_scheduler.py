@@ -6,8 +6,12 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.v1.early_recv import EarlyRecvTracker
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    NixlConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     kv_lease_extension,
@@ -17,7 +21,9 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -26,6 +32,8 @@ logger = init_logger(__name__)
 class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
     """Pull-specific scheduler logic (READ-based KV transfer)."""
 
+    _early_recv: EarlyRecvTracker | None = None
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -33,6 +41,41 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        assert vllm_config.kv_transfer_config is not None
+        self._early_recv = (
+            EarlyRecvTracker(vllm_config.parallel_config.world_size)
+            if vllm_config.kv_transfer_config.get_from_extra_config(
+                "enable_early_recv", False
+            )
+            else None
+        )
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> NixlConnectorMetadata:
+        meta = super().build_connector_meta(scheduler_output)
+        assert isinstance(meta, NixlConnectorMetadata)
+        if self._early_recv is not None:
+            for req_id, req_meta in meta.reqs_to_recv.items():
+                if req_meta.awaiting_kvs:
+                    self._early_recv.add_load(req_id)
+            meta.early_recv_path = self._early_recv.path
+        return meta
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        super().update_connector_output(connector_output)
+        if self._early_recv is not None:
+            self._early_recv.update_connector_output(connector_output)
+
+    def take_finished_recving(self) -> set[str]:
+        if self._early_recv is None:
+            return set()
+        return self._early_recv.take_finished()
+
+    def shutdown(self):
+        super().shutdown()
+        if self._early_recv is not None:
+            self._early_recv.close()
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -204,6 +247,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         """
         from vllm.v1.request import RequestStatus
 
+        if self._early_recv is not None:
+            self._early_recv.request_finished(request.request_id)
         params = request.kv_transfer_params
         logger.debug(
             "NIXLConnector request_finished(%s), request_status=%s, "

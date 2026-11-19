@@ -467,21 +467,6 @@ class KVConnectorBase_V1(ABC):
             finished_recving=set(finished_recving or ()),
         )
 
-    def has_pending_recving(self) -> bool:
-        """Whether `poll_finished_recving()` may return anything."""
-        return False
-
-    def poll_finished_recving(self) -> set[str]:
-        """Pop receives that completed successfully since the last poll.
-
-        Called on the worker thread before scheduling, including between RPCs
-        with mp. Returned requests must have all writes to their KV complete,
-        since an aborted request's blocks are freed once it is reported.
-        Report each load at most once, never again through
-        `get_transfer_results()`. Failed receives stay on the regular path.
-        """
-        return set()
-
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get the set of block IDs that failed to load.
 
@@ -698,6 +683,16 @@ class KVConnectorBase_V1(ABC):
 
         """
         return
+
+    def take_finished_recving(self) -> set[str]:
+        """Requests whose KV loads finished on every worker, reported ahead
+        of the step outputs. Called at the start of each schedule().
+
+        A connector that returns a request must remove it from
+        `finished_recving` when its step outputs reach
+        `update_connector_output()`.
+        """
+        return set()
 
     def request_finished(
         self,

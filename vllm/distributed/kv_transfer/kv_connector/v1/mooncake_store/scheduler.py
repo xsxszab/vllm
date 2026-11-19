@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.early_recv import EarlyRecvTracker
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.coordinator import (
     MooncakeStoreCoordinator,
 )
@@ -125,6 +126,8 @@ def _partial_tail_non_mamba_puts(
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
+    _early_recv: EarlyRecvTracker | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -190,6 +193,11 @@ class MooncakeStoreScheduler:
 
         self._gpu_block_pool: BlockPool | None = None
         self._num_workers = vllm_config.parallel_config.world_size
+        self._early_recv = (
+            EarlyRecvTracker(self._num_workers)
+            if kvc_extra_config.get("enable_early_recv", False)
+            else None
+        )
         self._next_store_job_id = 0
         # store_job_id -> (referenced block ids, ranks yet to report completion)
         self._pinned_saves: dict[int, tuple[list[int], int]] = {}
@@ -242,6 +250,13 @@ class MooncakeStoreScheduler:
             return 0, False
 
         if request.num_tokens < self._lookup_align():
+            return 0, False
+
+        if self._early_recv is not None and self._early_recv.awaits_step_output(
+            request.request_id
+        ):
+            # The step outputs of this request's previous load are in flight
+            # and would be counted for a new one.
             return 0, False
 
         lookup_result = self.client.lookup(
@@ -481,6 +496,8 @@ class MooncakeStoreScheduler:
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
+                    if self._early_recv is not None:
+                        self._early_recv.add_load(request_id)
 
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         if (
@@ -506,6 +523,8 @@ class MooncakeStoreScheduler:
 
         if not self._capacity_only:
             self._reference_save_blocks(meta.requests)
+        if self._early_recv is not None:
+            meta.early_recv_path = self._early_recv.path
         return meta
 
     def _apply_current_save_block_ids(
@@ -755,8 +774,23 @@ class MooncakeStoreScheduler:
                 )
             )
 
+    def take_finished_recving(self) -> set[str]:
+        if self._early_recv is None:
+            return set()
+        return self._early_recv.take_finished()
+
+    def request_finished(self, request_id: str) -> None:
+        if self._early_recv is not None:
+            self._early_recv.request_finished(request_id)
+
+    def shutdown(self) -> None:
+        if self._early_recv is not None:
+            self._early_recv.close()
+
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Drop the block references of store jobs every rank has finished."""
+        if self._early_recv is not None:
+            self._early_recv.update_connector_output(connector_output)
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return

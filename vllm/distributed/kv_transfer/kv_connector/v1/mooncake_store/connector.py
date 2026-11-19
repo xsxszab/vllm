@@ -237,12 +237,14 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         Closes the worker's MooncakeDistributedStore handle. A TransferEngine
         the store created is released with that handle. An engine borrowed from
         MooncakeConnector stays owned by that connector. Invoked from the
-        engine's explicit shutdown path and as a backstop from `__del__`;
-        a no-op on the scheduler role, which holds no store handle.
+        engine's explicit shutdown path and as a backstop from `__del__`.
         """
         worker = getattr(self, "connector_worker", None)
         if worker is not None:
             worker.close()
+        scheduler = getattr(self, "connector_scheduler", None)
+        if scheduler is not None:
+            scheduler.shutdown()
 
     def __del__(self):
         self.shutdown()
@@ -312,6 +314,7 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         # An in-flight store job holds its own reference on the blocks it reads,
         # so a finishing request never has to defer freeing them.
         assert self.connector_scheduler is not None
+        self.connector_scheduler.request_finished(request.request_id)
         self.connector_scheduler.register_finished_lookahead_save(request, block_ids)
         return False, None
 
@@ -364,6 +367,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             if not self._kv_cache_events.has_events():
                 self._kv_cache_events = None
             yield from events
+
+    def take_finished_recving(self) -> set[str]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.take_finished_recving()
 
     # ============================================================
     # Worker-side methods
@@ -433,14 +440,6 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, MooncakeStoreConnectorMetadata)
         return self.connector_worker.get_transfer_results(finished_req_ids, metadata)
-
-    def has_pending_recving(self) -> bool:
-        assert self.connector_worker is not None
-        return self.connector_worker.has_pending_recving()
-
-    def poll_finished_recving(self) -> set[str]:
-        assert self.connector_worker is not None
-        return self.connector_worker.poll_finished_recving()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         assert self.connector_worker is not None

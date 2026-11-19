@@ -301,6 +301,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # Where workers report finished loads ahead of the step outputs.
+        self.early_recv_path: str | None = None
 
     def _add_new_req(
         self,

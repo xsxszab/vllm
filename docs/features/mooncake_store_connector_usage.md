@@ -324,13 +324,13 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 ### Early Receive Reporting
 
-By default, a completed load is reported to the scheduler with the output of a later step, so the request is scheduled several steps after its KV cache has been loaded, and the delay grows with the PP size. Set `enable_early_recv` to report successful loads before that output. Failed loads are still reported with the step output.
+By default, a finished load is reported to the scheduler with the output of a later step, so the request resumes several steps after its KV cache is loaded, and the delay grows with the PP size. Set `enable_early_recv` to report each load that finishes without errors as soon as it finishes:
 
 ```bash
---kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","enable_early_recv":true}'
+--kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"enable_early_recv":true}}'
 ```
 
-PP > 1 is supported, unlike with NixlConnector (pull). See [Early Receive Reporting](nixl_connector_usage.md#early-receive-reporting) for the other supported setups and the polling overhead.
+It requires `load_async`, which is the default. See [Early Receive Reporting](nixl_connector_usage.md#early-receive-reporting) for the behavior shared with NixlConnector.
 
 ## Environment Variables
 

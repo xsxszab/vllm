@@ -40,6 +40,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     KVConnectorTransferResults,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.early_recv import (
+    EarlyRecvReporter,
+    EarlyRecvTracker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
@@ -95,6 +99,7 @@ from .utils import (
     maybe_update_block_size,
     region_pairs_by_index,
     remote_stage,
+    take_early_reports,
 )
 
 
@@ -2542,7 +2547,6 @@ def recv_worker():
     worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
         remote_block_size=16, remote_physical_blocks_per_logical=1
     )
-    worker.block_size = 16
     worker._physical_blocks_per_logical_kv_block = 1
     worker._recving_metadata = {"request": MagicMock(local_block_ids=([1, 2, 3],))}
     worker._engine_clock_offset = {}
@@ -4662,79 +4666,53 @@ def test_recv_failure_waits_for_sibling_transfer(recv_worker, sibling_state):
     assert worker.get_block_ids_with_load_errors() == set()
 
 
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("collect_in_step", [False, True])
-def test_early_recv_reports_successes_only_through_poll(recv_worker, collect_in_step):
-    worker = recv_worker
-    worker._early_recved = set()
-    worker._recving_transfers["request"] = [101]
-    worker.nixl_wrapper.check_xfer_state.return_value = "PROC"
-    assert worker.poll_finished_recving() == set()
-    worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
-    if collect_in_step:
-        assert worker.get_transfer_results().finished_recving == set()
-    assert worker.poll_finished_recving() == {"request"}
-    assert worker.poll_finished_recving() == set()
-    assert worker.get_transfer_results().finished_recving == set()
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("permute,remote_block_size", [(True, 16), (False, 8)])
-def test_early_recv_leaves_post_processing_to_the_step(
-    recv_worker, permute, remote_block_size
+@pytest.mark.parametrize(
+    "outcome", ["done", "failed", "lease_lapsed", "post_processed"]
+)
+def test_early_recv_reports_successful_reads_without_post_processing(
+    recv_worker, outcome
 ):
-    """Layout conversion and heterogeneous blocks finish only through step output."""
+    """Only successful reads that need no post-processing are reported early.
+    The step output still reports every read."""
     worker = recv_worker
-    worker._early_recved = set()
-    worker.enable_permute_local_kv = permute
-    worker.transfer_topo.get_engine_info.return_value.remote_block_size = (
-        remote_block_size
+    tracker = EarlyRecvTracker(num_workers=1)
+    tracker.add_load("request")
+    worker._early_recv = EarlyRecvReporter(rank=0)
+    worker._early_recv.connect(tracker.path)
+    worker._early_recv_reqs = set() if outcome == "post_processed" else {"request"}
+    worker._recving_transfers["request"] = [101]
+    worker.nixl_wrapper.check_xfer_state.return_value = (
+        "ERR" if outcome == "failed" else "DONE"
     )
-    worker._recving_transfers["request"] = [101]
-    worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
-    assert not worker.has_pending_recving()
-    assert worker.poll_finished_recving() == set()
-    assert worker.get_transfer_results().finished_recving == {"request"}
-    assert worker.poll_finished_recving() == set()
+    if outcome == "lease_lapsed":
+        worker._lease_safety_margin = 0.0
+        remote = worker._recving_metadata["request"].remote
+        remote.blocks_expiry_time = 0.0
+        worker._engine_clock_offset[remote.engine_id] = 0.0
 
-
-@pytest.mark.cpu_test
-def test_early_recv_leaves_failures_to_the_step(recv_worker):
-    worker = recv_worker
-    worker._early_recved = set()
-    worker._recving_transfers["request"] = [101]
-    worker.nixl_wrapper.check_xfer_state.return_value = "ERR"
-    worker.nixl_wrapper.release_xfer_handle.side_effect = [
-        RuntimeError("release"),
-        None,
-    ]
-    assert worker.poll_finished_recving() == set()
-    assert not worker.has_pending_recving()
-    assert worker.poll_finished_recving() == set()
-    assert worker.nixl_wrapper.check_xfer_state.call_count == 1
     results = worker.get_transfer_results()
-    assert results.finished_recving == results.failed_recving == {"request"}
-    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
+
+    failed = outcome in ("failed", "lease_lapsed")
+    assert results.finished_recving == {"request"}
+    assert results.failed_recving == ({"request"} if failed else set())
+    expected = {"request"} if outcome == "done" else set()
+    assert take_early_reports(tracker, [worker._early_recv]) == expected
+    assert not worker._early_recv_reqs
+    worker._early_recv.close()
+    tracker.close()
 
 
-@pytest.mark.cpu_test
-def test_early_recv_leaves_lease_lapsed_reads_to_the_step(recv_worker):
-    """A read that may have outlived the remote's lease is never reported as
-    loaded early; the step output reports it failed."""
+@pytest.mark.parametrize("change", [None, "permute", "block_size", "zeroing"])
+def test_can_early_recv_excludes_reads_that_need_post_processing(recv_worker, change):
     worker = recv_worker
-    worker._early_recved = set()
-    worker._lease_safety_margin = 0.0
-    remote = worker._recving_metadata["request"].remote
-    remote.blocks_expiry_time = 0.0
-    worker._engine_clock_offset[remote.engine_id] = 0.0
-    worker._recving_transfers["request"] = [101]
-    worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
-    with patch.object(worker.xfer_stats, "record_declined_expired_read") as declined:
-        assert worker.poll_finished_recving() == set()
-        results = worker.get_transfer_results()
-    assert results.finished_recving == results.failed_recving == {"request"}
-    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
-    assert declined.call_count == 1
+    worker.block_size = 16
+    worker.enable_permute_local_kv = change == "permute"
+    worker.transfer_topo.get_engine_info.return_value.remote_block_size = (
+        8 if change == "block_size" else 16
+    )
+    meta = worker._recving_metadata["request"]
+    meta.region_blocks_to_zero = [[7]] if change == "zeroing" else None
+    assert worker._can_early_recv(meta) == (change is None)
 
 
 def test_recv_failure_waits_for_unpollable_handle_to_be_released(recv_worker):

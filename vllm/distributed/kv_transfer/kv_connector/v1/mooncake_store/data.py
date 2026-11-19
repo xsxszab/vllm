@@ -421,6 +421,8 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        # Where workers report finished loads ahead of the step outputs.
+        self.early_recv_path: str | None = None
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)

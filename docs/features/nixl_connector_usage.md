@@ -452,16 +452,15 @@ Support use case: Prefill with `LBHNC` and decode with `LBNHC` with experimental
 
 ## Early Receive Reporting
 
-A decoder normally learns that a NIXL pull finished from the output of a later step. Set `enable_early_recv` (disabled by default) on the decoder to report completed pulls before that output, so the request can be scheduled sooner:
+A decoder normally learns that a pull finished from the output of the step that checked it, which reaches the scheduler only after that step's model output. Set `enable_early_recv` on the decoder to report finished pulls to the scheduler as soon as a worker sees them, so the request can be scheduled sooner:
 
 ```bash
---kv-transfer-config '{..., "enable_early_recv": true}'
+--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"enable_early_recv":true}}'
 ```
 
-- **Supported**: the `uni` executor or single-node `mp`, sync or async scheduling, and TP, with NixlConnector (pull) or MooncakeStoreConnector, used directly or inside MultiConnector. NIXL pull requires PP to be 1 regardless of the KV role; MooncakeStoreConnector also works with PP > 1.
-- **Unchanged**: a request still waits for every rank and for free KV blocks, and transfer failures and invalid blocks follow `kv_load_failure_policy`; a load with an error on any rank completes through step outputs, after the error. Unexpected polling errors stop the engine, even while it is paused.
-- **Overhead**: with `mp`, workers poll every 0.2 ms between RPCs while pulls are pending. An RPC that arrives during a poll waits for it to finish.
-- **NIXL scope**: early reporting is limited to direct receives with matching block sizes and physical block layouts, without layout conversion or padding zeroing. Receives requiring any of those operations or host-buffer staging use regular step outputs even when `enable_early_recv` is true. Transfer metrics are still reported with regular step outputs.
+- A request still waits until every worker has finished its pull. Step outputs still report every pull, so a lost early report only delays the request, and failed pulls follow `kv_load_failure_policy` as without the option.
+- Only pulls that need no post-processing are reported early: matching block sizes and physical block layouts, without layout conversion, padding zeroing or host-buffer staging.
+- Workers report over an IPC socket, so they must run on the same node as the engine core.
 
 ## Metrics Reference
 

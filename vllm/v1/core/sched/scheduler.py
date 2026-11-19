@@ -700,6 +700,12 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.connector is not None:
+            for req_id in self.connector.take_finished_recving():
+                self.finished_recving_kv_req_ids.add(req_id)
+                self._set_kv_fetch_stage(
+                    self.requests[req_id], KV_FETCH_COMPLETED_WAITING
+                )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -3699,11 +3705,6 @@ class Scheduler(SchedulerInterface):
             return False
 
         return True
-
-    def add_finished_recving(self, request_ids: set[str]) -> None:
-        self._update_from_kv_xfer_finished(
-            KVConnectorOutput(finished_recving=request_ids)
-        )
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """KV Connector: update the scheduler state based on the output.

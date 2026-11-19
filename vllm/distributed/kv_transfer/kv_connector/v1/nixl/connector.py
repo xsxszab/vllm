@@ -374,8 +374,6 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
 class NixlPullConnector(NixlBaseConnector):
     """Pull-based (READ) NIXL KV transfer connector."""
 
-    connector_worker: NixlPullConnectorWorker | None
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -413,13 +411,9 @@ class NixlPullConnector(NixlBaseConnector):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
-    def has_pending_recving(self) -> bool:
-        assert self.connector_worker is not None
-        return self.connector_worker.has_pending_recving()
-
-    def poll_finished_recving(self) -> set[str]:
-        assert self.connector_worker is not None
-        return self.connector_worker.poll_finished_recving()
+    def take_finished_recving(self) -> set[str]:
+        assert isinstance(self.connector_scheduler, NixlPullConnectorScheduler)
+        return self.connector_scheduler.take_finished_recving()
 
 
 class NixlPushConnector(NixlBaseConnector):
