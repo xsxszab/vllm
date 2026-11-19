@@ -8,6 +8,7 @@ The step outputs still report every load; the scheduler-side connector drops
 the loads it already reported, so a lost report only delays the request.
 """
 
+import contextlib
 import threading
 from collections.abc import Iterable
 
@@ -50,14 +51,10 @@ class EarlyRecvReporter:
         if not req_ids:
             return
         message = msgspec.msgpack.encode((self._rank, req_ids))
-        with self._lock:
-            if self._socket is None:
-                return
-            try:
+        # A dropped report only delays the request: step outputs report it too.
+        with self._lock, contextlib.suppress(zmq.Again):
+            if self._socket is not None:
                 self._socket.send(message, zmq.NOBLOCK)
-            except zmq.Again:
-                # The step outputs still report these loads.
-                pass
 
     def close(self) -> None:
         with self._lock:
