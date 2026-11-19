@@ -6607,6 +6607,7 @@ def test_prepend_skipped_requests_order():
 def test_remote_kv_promotion_drains_before_grammar_prefix():
     scheduler = create_scheduler(max_num_seqs=1)
     scheduler.connector = Mock()
+    scheduler.connector.take_finished_recving.return_value = set()
     scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
 
     requests = create_requests(num_requests=4)

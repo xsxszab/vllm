@@ -75,6 +75,7 @@ EOS_TOKEN_ID = 50256
 
 def create_mock_connector() -> Mock:
     connector = Mock()
+    connector.take_finished_recving.return_value = set()
     connector.get_external_cache_hit_sources.side_effect = lambda request, num_tokens: (
         {CacheHitSource.EXTERNAL_UNSPECIFIED: num_tokens} if num_tokens else {}
     )
