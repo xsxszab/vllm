@@ -1531,9 +1531,8 @@ def _reused_transfer_engine() -> SharedMooncakeTransferEngine:
 class MooncakeStoreWorker:
     """Worker-side component for MooncakeStoreConnector."""
 
+    # Bare workers built with __new__ in tests read these defaults.
     _early_recv: EarlyRecvReporter | None = None
-
-    # Bare workers built with __new__ in tests read this default.
     _reuse_pd_transfer_engine: bool = False
 
     @staticmethod

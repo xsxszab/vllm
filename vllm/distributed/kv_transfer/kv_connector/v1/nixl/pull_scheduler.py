@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
     """Pull-specific scheduler logic (READ-based KV transfer)."""
 
+    # Bare schedulers built with __new__ in tests read this default.
     _early_recv: EarlyRecvTracker | None = None
 
     def __init__(

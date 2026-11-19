@@ -39,6 +39,7 @@ logger = init_logger(__name__)
 class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     """Pull-specific (READ) worker logic."""
 
+    # Bare workers built with __new__ in tests read this default.
     _early_recv: EarlyRecvReporter | None = None
 
     def __init__(

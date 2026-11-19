@@ -126,6 +126,7 @@ def _partial_tail_non_mamba_puts(
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
+    # Bare schedulers built with __new__ in tests read this default.
     _early_recv: EarlyRecvTracker | None = None
 
     def __init__(
