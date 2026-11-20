@@ -247,8 +247,8 @@ the copy-engine backend checks its own platform and parallelism requirements;
 if unavailable, tensor-dict communication uses the device process group
 (NCCL on CUDA, HCCL on Ascend). Forcing `copy_engine` reports unsupported
 configurations from that backend. SP bindings with ubatching/DBO are unsupported.
-Models without a schema retain full-tensor behavior, including arbitrary legacy
-intermediate keys and dtype-converting receive copies.
+Undeclared fields, including all fields of models without a schema, use the
+full-tensor layout.
 
 Downstream workers that override PP communication must forward the schema's
 `send_all_gather_tensors` and `recv_all_gather_tensors` to the corresponding
