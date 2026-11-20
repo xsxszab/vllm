@@ -1182,9 +1182,11 @@ class PPStageHandoff:
         other stages take the previous stage's tensors.
         """
         if self.is_first_stage:
-            if inputs_embeds is None:
-                inputs_embeds = embed_input_ids(input_ids)
-            hidden_states, residual = inputs_embeds, None
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = embed_input_ids(input_ids)
+            residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
