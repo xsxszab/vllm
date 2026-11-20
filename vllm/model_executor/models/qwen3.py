@@ -68,8 +68,8 @@ from .interfaces import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    PPStageHandoff,
     WeightsMapper,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
     spec_decode_needs_target_embed,
@@ -372,8 +372,9 @@ class Qwen3Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+        self.pp_handoff = PPStageHandoff(config.hidden_size)
+        self.make_empty_intermediate_tensors = (
+            self.pp_handoff.make_empty_intermediate_tensors
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -390,19 +391,12 @@ class Qwen3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        hidden_states, residual = self.pp_handoff.enter(
+            input_ids, inputs_embeds, intermediate_tensors, self.embed_input_ids
+        )
 
         aux_hidden_states: list[torch.Tensor] = []
-        if get_pp_group().is_first_rank:
+        if self.pp_handoff.is_first_stage:
             self._maybe_add_hidden_state(
                 aux_hidden_states, self.start_layer, hidden_states, residual
             )
@@ -415,13 +409,11 @@ class Qwen3Model(nn.Module, EagleModelMixin):
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
 
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                    **self.pack_local_aux_hidden_states(aux_hidden_states),
-                }
+        if not self.pp_handoff.is_last_stage:
+            return self.pp_handoff.exit(
+                hidden_states,
+                residual,
+                **self.pack_local_aux_hidden_states(aux_hidden_states),
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)

@@ -17,6 +17,7 @@ from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -1145,6 +1146,80 @@ def make_empty_intermediate_tensors_factory(
         )
 
     return make_empty_intermediate_tensors
+
+
+class PPStageHandoff:
+    """The intermediate tensors a decoder stack hands to the next pipeline stage.
+
+    Every stage boundary carries `hidden_states` and `residual` of `hidden_size`,
+    with all tokens and identical on every TP rank. The receive buffers, `enter`
+    and `exit` all follow from this declaration. A `sequence_parallel` stack runs
+    on its TP rank's token shard: `enter` splits the tensors into that shard and
+    `exit` gathers the shards back.
+    """
+
+    def __init__(self, hidden_size: int, *, sequence_parallel: bool = False) -> None:
+        from vllm.distributed.parallel_state import get_pp_group
+
+        pp_group = get_pp_group()
+        self.is_first_stage = pp_group.is_first_rank
+        self.is_last_stage = pp_group.is_last_rank
+        self.sequence_parallel = sequence_parallel
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], hidden_size
+        )
+
+    def enter(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        intermediate_tensors: IntermediateTensors | None,
+        embed_input_ids: Callable[[torch.Tensor], torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the stack's input `hidden_states` and `residual`.
+
+        The first stage starts from the input embeddings with no residual; the
+        other stages take the previous stage's tensors.
+        """
+        if self.is_first_stage:
+            if inputs_embeds is None:
+                inputs_embeds = embed_input_ids(input_ids)
+            hidden_states, residual = inputs_embeds, None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+        if self.sequence_parallel:
+            hidden_states = sequence_parallel_chunk(hidden_states)
+            if residual is not None:
+                residual = sequence_parallel_chunk(residual)
+        return hidden_states, residual
+
+    def exit(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        *,
+        num_tokens: int | None = None,
+        **tensors: torch.Tensor,
+    ) -> IntermediateTensors:
+        """Return the intermediate tensors for the next stage.
+
+        Args:
+            hidden_states: The stack's output hidden states.
+            residual: The stack's output residual.
+            num_tokens: The number of tokens in the batch, which a
+                `sequence_parallel` stack needs to drop the shard padding.
+            tensors: Further tensors sent to the next stage as they are.
+        """
+        if self.sequence_parallel:
+            assert num_tokens is not None
+            packed = torch.cat([hidden_states, residual], dim=-1)
+            packed = tensor_model_parallel_all_gather(packed, 0)[:num_tokens]
+            hidden_states, residual = packed.chunk(2, dim=-1)
+        return IntermediateTensors(
+            {"hidden_states": hidden_states, "residual": residual, **tensors}
+        )
 
 
 def maybe_prefix(prefix: str, name: str) -> str:

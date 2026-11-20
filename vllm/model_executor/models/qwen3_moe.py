@@ -35,7 +35,6 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
-    get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -76,9 +75,9 @@ from .interfaces import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    PPStageHandoff,
     WeightsMapper,
     extract_layer_index,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -469,8 +468,9 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+        self.pp_handoff = PPStageHandoff(config.hidden_size)
+        self.make_empty_intermediate_tensors = (
+            self.pp_handoff.make_empty_intermediate_tensors
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -483,16 +483,9 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        hidden_states, residual = self.pp_handoff.enter(
+            input_ids, inputs_embeds, intermediate_tensors, self.embed_input_ids
+        )
 
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, residual
@@ -506,10 +499,8 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+        if not self.pp_handoff.is_last_stage:
+            return self.pp_handoff.exit(hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
 
         # Return auxiliary hidden states if collected

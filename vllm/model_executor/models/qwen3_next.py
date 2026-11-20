@@ -80,10 +80,10 @@ from .interfaces import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    PPStageHandoff,
     WeightsMapper,
     extract_layer_index,
     get_fused_shared_expert_layers,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_fuse_shared_experts,
     maybe_prefix,
@@ -702,8 +702,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             Qwen3NextSparseMoeBlock,
             enable_eplb=parallel_config.enable_eplb,
         )
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+        self.pp_handoff = PPStageHandoff(
+            config.hidden_size, sequence_parallel=self.use_sequence_parallel
+        )
+        self.make_empty_intermediate_tensors = (
+            self.pp_handoff.make_empty_intermediate_tensors
         )
 
         if get_pp_group().is_last_rank:
@@ -727,23 +730,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        hidden_states, residual = self.pp_handoff.enter(
+            input_ids, inputs_embeds, intermediate_tensors, self.embed_input_ids
+        )
 
         full_num_tokens = positions.shape[-1]
-        if self.use_sequence_parallel:
-            hidden_states = sequence_parallel_chunk(hidden_states)
-            if residual is not None:
-                residual = sequence_parallel_chunk(residual)
-
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -758,14 +749,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
-        if not get_pp_group().is_last_rank:
-            if self.use_sequence_parallel:
-                # PP transport expects full-token tensors replicated across TP ranks.
-                packed = torch.cat([hidden_states, residual], dim=-1)
-                packed = tensor_model_parallel_all_gather(packed, 0)[:full_num_tokens]
-                hidden_states, residual = packed.chunk(2, dim=-1)
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+        if not self.pp_handoff.is_last_stage:
+            return self.pp_handoff.exit(
+                hidden_states, residual, num_tokens=full_num_tokens
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         if self.use_sequence_parallel:

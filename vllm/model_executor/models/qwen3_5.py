@@ -93,11 +93,11 @@ from .qwen3_vl import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    PPStageHandoff,
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     get_fused_shared_expert_layers,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_fuse_shared_experts,
     maybe_prefix,
@@ -264,8 +264,11 @@ class Qwen3_5Model(Qwen3NextModel):
             Qwen3NextSparseMoeBlock,
             enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+        self.pp_handoff = PPStageHandoff(
+            config.hidden_size, sequence_parallel=self.use_sequence_parallel
+        )
+        self.make_empty_intermediate_tensors = (
+            self.pp_handoff.make_empty_intermediate_tensors
         )
 
         if get_pp_group().is_last_rank:
