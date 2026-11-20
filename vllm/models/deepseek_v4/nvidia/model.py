@@ -16,7 +16,6 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-from vllm.distributed.pp_transport.fields import PPTransportField
 from vllm.distributed.pp_transport.schema import (
     PPTransportSchema,
     PPTransportTensorSpec,
@@ -887,7 +886,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.pp_transport_schema = PPTransportSchema(
             {
-                PPTransportField.HIDDEN_STATES: PPTransportTensorSpec(
+                "hidden_states": PPTransportTensorSpec(
                     (self.hc_mult, config.hidden_size)
                 ),
             },

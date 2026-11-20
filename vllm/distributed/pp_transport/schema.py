@@ -4,11 +4,9 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 
 import torch
 
-from vllm.distributed.pp_transport.fields import PPTransportField
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
@@ -44,7 +42,7 @@ class PPTransportSchema:
 
     def __init__(
         self,
-        specs: Mapping[PPTransportField | str, PPTransportTensorSpec] | None = None,
+        specs: Mapping[str, PPTransportTensorSpec] | None = None,
         *,
         tp_size: int = 1,
     ):
@@ -58,7 +56,7 @@ class PPTransportSchema:
 
     def register_tensor(
         self,
-        name: PPTransportField | str,
+        name: str,
         spec: PPTransportTensorSpec,
         *,
         receive: bool = True,
@@ -67,7 +65,6 @@ class PPTransportSchema:
         """Register a model-local field before allocating or using its buffers."""
         if not isinstance(name, str) or not name.strip():
             raise ValueError("PP field names must be nonempty strings")
-        name = str(name)
         if not receive and not send:
             raise ValueError("PP field must be received or sent")
         if (receive and name in self._recv_specs) or (
@@ -78,16 +75,6 @@ class PPTransportSchema:
             self._recv_specs[name] = spec
         if send:
             self._send_specs[name] = spec
-
-    @property
-    def recv_specs(self) -> Mapping[str, PPTransportTensorSpec]:
-        """Read-only live view of explicitly registered receive fields."""
-        return MappingProxyType(self._recv_specs)
-
-    @property
-    def send_specs(self) -> Mapping[str, PPTransportTensorSpec]:
-        """Read-only live view of explicitly registered send fields."""
-        return MappingProxyType(self._send_specs)
 
     @property
     def has_sequence_parallel_tensors(self) -> bool:
