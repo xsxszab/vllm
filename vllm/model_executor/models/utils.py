@@ -1211,6 +1211,7 @@ class PPStageHandoff:
             num_tokens: The number of tokens in the batch, which a
                 `sequence_parallel` stack needs to drop the shard padding.
             tensors: Further tensors sent to the next stage as they are.
+
         """
         if self.sequence_parallel:
             assert num_tokens is not None
