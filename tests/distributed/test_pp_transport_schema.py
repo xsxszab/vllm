@@ -12,7 +12,6 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 from vllm.distributed.parallel_state import GroupCoordinator
-from vllm.distributed.pp_transport.ops import copy_intermediate_tensors
 from vllm.distributed.pp_transport.schema import (
     PPTransportSchema,
     PPTransportTensorSpec,
@@ -140,7 +139,7 @@ def test_pp2_tp2_tensor_dict_transport(tmp_path):
 
 @pytest.mark.parametrize("sharded_field", ["hidden_states", "residual"])
 @pytest.mark.parametrize("shape", [(4,), (4, 8)])
-def test_mixed_views_keep_capture_shapes_and_addresses(sharded_field, shape):
+def test_mixed_views_keep_field_shapes_and_addresses(sharded_field, shape):
     transport = PPTransportSchema(
         {
             field: PPTransportTensorSpec(
@@ -155,13 +154,6 @@ def test_mixed_views_keep_capture_shapes_and_addresses(sharded_field, shape):
     )
     addresses = {key: value.data_ptr() for key, value in buffers.items()}
 
-    def forward(hidden_states, residual, num_tokens):
-        received = IntermediateTensors(
-            {"hidden_states": hidden_states, "residual": residual}
-        )
-        return transport.prepare_inputs(buffers, num_tokens, received)
-
-    captures = []
     for num_tokens in (5, 2):
         values = {
             field: torch.full(
@@ -174,14 +166,11 @@ def test_mixed_views_keep_capture_shapes_and_addresses(sharded_field, shape):
             )
             for field in ("hidden_states", "residual")
         }
-        output = forward(**values, num_tokens=num_tokens)
-        captured = copy_intermediate_tensors(buffers, output)
-        captures.append(captured)
-        for key, expected in values.items():
-            torch.testing.assert_close(captured[key], expected, rtol=0, atol=0)
-            assert captured[key].data_ptr() == addresses[key]
-    assert captures[0][sharded_field].shape == (3, *shape)
-    assert captures[1][sharded_field].shape == (1, *shape)
+        views = transport.prepare_inputs(
+            buffers, num_tokens, IntermediateTensors(values)
+        )
+        torch.testing.assert_close(views.tensors, values, rtol=0, atol=0)
+        assert {key: value.data_ptr() for key, value in views.items()} == addresses
 
 
 @pytest.mark.parametrize("sequence_parallel", [None, False, True])
@@ -219,20 +208,6 @@ def test_sharded_receive_rejects_different_stage_padding():
         )
 
 
-@pytest.mark.parametrize(
-    "source",
-    [torch.zeros(2, 5), torch.zeros(9, 4), torch.zeros(2, 4, dtype=torch.float64)],
-)
-def test_capture_copy_rejects_invalid_layout_without_changing_buffer(source):
-    buffer = torch.full((8, 4), -1.0)
-    with pytest.raises(ValueError, match="Invalid residual"):
-        copy_intermediate_tensors(
-            IntermediateTensors({"residual": buffer}),
-            IntermediateTensors({"residual": source}),
-        )
-    torch.testing.assert_close(buffer, torch.full_like(buffer, -1))
-
-
 class DownstreamSchema(PPTransportSchema):
     def __init__(self):
         super().__init__({"hidden_states": PPTransportTensorSpec((4,))}, tp_size=2)
@@ -251,26 +226,16 @@ def test_downstream_descriptor_drives_all_buffer_views():
     assert buffers["downstream.route_state"].shape == (10, 2)
     assert transport.send_all_gather_tensors == {"downstream.route_state": False}
 
-    def forward(hidden, route, num_tokens):
-        return transport.prepare_inputs(
-            buffers,
-            num_tokens,
-            IntermediateTensors(
-                {"hidden_states": hidden, "downstream.route_state": route}
-            ),
-        )
-
     for num_tokens, local_rows in ((9, 5), (2, 1)):
         expected = {
             "hidden_states": torch.full((num_tokens, 4), 3.0),
             "downstream.route_state": torch.full((local_rows, 2), 7, dtype=torch.int32),
         }
-        output = forward(
-            expected["hidden_states"], expected["downstream.route_state"], num_tokens
+        views = transport.prepare_inputs(
+            buffers, num_tokens, IntermediateTensors(dict(expected))
         )
-        captured = copy_intermediate_tensors(buffers, output)
-        torch.testing.assert_close(captured.tensors, expected, rtol=0, atol=0)
-        assert {key: value.data_ptr() for key, value in captured.items()} == addresses
+        torch.testing.assert_close(views.tensors, expected, rtol=0, atol=0)
+        assert {key: value.data_ptr() for key, value in views.items()} == addresses
 
 
 def test_registration_is_model_local():

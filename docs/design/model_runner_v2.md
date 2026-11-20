@@ -278,8 +278,7 @@ boundary. Configure all fields before allocating buffers or capturing graphs.
 
 These extension points cover tensor layouts and buffers. Cache gather/scatter,
 state synchronization and device collectives remain downstream responsibilities.
-`vllm.distributed.pp_transport.ops` contains the tensor-copy helper used by
-CUDA graph capture and replay. NPU integration requires downstream validation.
+NPU integration requires downstream validation.
 
 ## Development Philosophy
 

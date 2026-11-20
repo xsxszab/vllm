@@ -35,7 +35,6 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
 )
-from vllm.distributed.pp_transport.ops import copy_intermediate_tensors
 from vllm.distributed.pp_transport.schema import PPTransportSchema
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -743,8 +742,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                             for k, v in intermediate_tensors.tensors.items()
                         }
                     )
-                self.captured_intermediate_tensors[desc] = copy_intermediate_tensors(
-                    self.intermediate_tensors, intermediate_tensors
+                # Keep each field's captured rows: SP fields have fewer.
+                self.captured_intermediate_tensors[desc] = IntermediateTensors(
+                    {
+                        k: self.intermediate_tensors[k][: v.shape[0]].copy_(v)
+                        for k, v in intermediate_tensors.tensors.items()
+                    }
                 )
 
         def create_forward_fn(
